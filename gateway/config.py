@@ -12,7 +12,16 @@ class Settings(BaseSettings):
     model_balanced: str = "llama3.2:1b"
     model_powerful: str = "llama3.2:1b"
 
+    # Auth — disabled by default for local dev
+    # Set GATEWAY_API_KEYS="key1,key2" to enable
+    auth_enabled: bool = False
+    api_keys: str = ""
+
     model_config = {"env_prefix": "GATEWAY_"}
+
+    @property
+    def api_key_set(self) -> set[str]:
+        return {k.strip() for k in self.api_keys.split(",") if k.strip()}
 
 
 settings = Settings()
