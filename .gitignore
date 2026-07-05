@@ -32,3 +32,6 @@ grafana_data/
 
 # Benchmark output
 *.json.bak
+
+# Docs
+CODE*.md
