@@ -9,6 +9,21 @@ services:
       GATEWAY_OLLAMA_BASE_URL: "http://host.docker.internal:11434"
       GATEWAY_DEFAULT_MODEL: "llama3.2:1b"
       GATEWAY_MAX_CONCURRENT_REQUESTS: "4"
+      GATEWAY_TRACING_ENABLED: "true"
+      GATEWAY_OTLP_ENDPOINT: "http://jaeger:4317"
+    networks:
+      - stack
+    restart: unless-stopped
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC receiver
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
     networks:
       - stack
     restart: unless-stopped
