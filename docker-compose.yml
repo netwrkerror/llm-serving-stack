@@ -1,0 +1,18 @@
+services:
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      GATEWAY_OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      GATEWAY_DEFAULT_MODEL: "llama3.2:1b"
+      GATEWAY_MAX_CONCURRENT_REQUESTS: "4"
+    networks:
+      - stack
+    restart: unless-stopped
+
+networks:
+  stack:
+    driver: bridge
