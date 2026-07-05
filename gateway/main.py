@@ -13,6 +13,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from .backend import ollama_backend
 from .config import settings
 from .metrics import ACTIVE_REQUESTS, REQUEST_COUNT, REQUEST_DURATION, THROUGHPUT, TOKENS_GENERATED, TTFT
+from .router import classify, select_model
 from .schemas import (
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -74,15 +75,24 @@ async def prometheus_metrics():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    model = req.model
-    ACTIVE_REQUESTS.labels(model=model).inc()
+    routed_model = select_model(req)
+    tier = classify(req)
+    req = req.model_copy(update={"model": routed_model})
+
+    ACTIVE_REQUESTS.labels(model=routed_model).inc()
     try:
         async with _queue:
             if req.stream:
-                return _stream_response(req)
-            return await _sync_response(req)
+                resp = _stream_response(req)
+            else:
+                resp = await _sync_response(req)
+
+        if hasattr(resp, "headers"):
+            resp.headers["X-Model-Tier"] = tier
+            resp.headers["X-Routed-Model"] = routed_model
+        return resp
     finally:
-        ACTIVE_REQUESTS.labels(model=model).dec()
+        ACTIVE_REQUESTS.labels(model=routed_model).dec()
 
 
 def _stream_response(req: ChatCompletionRequest) -> StreamingResponse:

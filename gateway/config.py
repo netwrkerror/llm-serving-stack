@@ -7,6 +7,11 @@ class Settings(BaseSettings):
     max_concurrent_requests: int = 4
     request_timeout: float = 120.0
 
+    # Model tiers for automatic routing
+    model_fast: str = "llama3.2:1b"
+    model_balanced: str = "llama3.2:1b"
+    model_powerful: str = "llama3.2:1b"
+
     model_config = {"env_prefix": "GATEWAY_"}
 
 
