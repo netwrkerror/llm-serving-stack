@@ -1,10 +1,13 @@
 import asyncio
+import json
 import time
+import uuid
 from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .backend import ollama_backend
@@ -75,9 +78,53 @@ async def chat_completions(req: ChatCompletionRequest):
     ACTIVE_REQUESTS.labels(model=model).inc()
     try:
         async with _queue:
+            if req.stream:
+                return _stream_response(req)
             return await _sync_response(req)
     finally:
         ACTIVE_REQUESTS.labels(model=model).dec()
+
+
+def _stream_response(req: ChatCompletionRequest) -> StreamingResponse:
+    model = req.model
+
+    async def event_stream() -> AsyncIterator[str]:
+        start = time.perf_counter()
+        first_token_recorded = False
+        try:
+            async for token, done, token_count in ollama_backend.generate_stream(req):
+                if token and not first_token_recorded:
+                    TTFT.labels(model=model).observe(time.perf_counter() - start)
+                    first_token_recorded = True
+
+                if token:
+                    chunk = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+                if done:
+                    duration = time.perf_counter() - start
+                    REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
+                    REQUEST_DURATION.labels(model=model, stream="true").observe(duration)
+                    TOKENS_GENERATED.labels(model=model).inc(token_count)
+                    THROUGHPUT.labels(model=model).observe(token_count / duration if duration > 0 else 0)
+                    final = {
+                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(final)}\n\n"
+                    yield "data: [DONE]\n\n"
+        except Exception as exc:
+            REQUEST_COUNT.labels(model=model, status="error", stream="true").inc()
+            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 async def _sync_response(req: ChatCompletionRequest) -> ChatCompletionResponse:
