@@ -5,7 +5,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -13,6 +13,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from .auth import APIKeyMiddleware
 from .backend import ollama_backend
 from .config import settings
+from .limiter import rate_limiter
 from .metrics import ACTIVE_REQUESTS, REQUEST_COUNT, REQUEST_DURATION, THROUGHPUT, TOKENS_GENERATED, TTFT
 from .router import classify, select_model
 from .schemas import (
@@ -76,7 +77,17 @@ async def prometheus_metrics():
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
+async def chat_completions(req: ChatCompletionRequest, request: Request):
+    api_key = request.headers.get("Authorization", "")[len("Bearer "):].strip() or "anonymous"
+
+    allowed, reason = rate_limiter.check_request(api_key)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=reason)
+
+    allowed, reason = rate_limiter.check_tokens(api_key, req.max_tokens or 512)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=reason)
+
     routed_model = select_model(req)
     tier = classify(req)
     req = req.model_copy(update={"model": routed_model})

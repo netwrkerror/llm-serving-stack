@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     auth_enabled: bool = False
     api_keys: str = ""
 
+    # Rate limiting — disabled by default
+    # Set GATEWAY_RATE_LIMIT_ENABLED="true" to enable
+    rate_limit_enabled: bool = False
+    max_requests_per_minute: int = 60
+    max_tokens_per_minute: int = 10_000
+
     model_config = {"env_prefix": "GATEWAY_"}
 
     @property
