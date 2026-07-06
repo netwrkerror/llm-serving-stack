@@ -16,6 +16,7 @@ from .config import settings
 from .limiter import rate_limiter
 from .metrics import ACTIVE_REQUESTS, REQUEST_COUNT, REQUEST_DURATION, THROUGHPUT, TOKENS_GENERATED, TTFT
 from .router import classify, select_model
+from .tracing import get_tracer, setup_tracing
 from .schemas import (
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -29,9 +30,11 @@ _queue = asyncio.Semaphore(settings.max_concurrent_requests)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    setup_tracing()
     print("LLM Inference Gateway starting")
-    print(f"  backend : {settings.ollama_base_url}")
-    print(f"  queue   : {settings.max_concurrent_requests} concurrent slots")
+    print(f"  backend  : {settings.ollama_base_url}")
+    print(f"  queue    : {settings.max_concurrent_requests} concurrent slots")
+    print(f"  tracing  : {'enabled → ' + settings.otlp_endpoint if settings.tracing_enabled else 'disabled'}")
     yield
     await ollama_backend.close()
     print("Gateway stopped")
@@ -94,11 +97,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     ACTIVE_REQUESTS.labels(model=routed_model).inc()
     try:
-        async with _queue:
-            if req.stream:
-                resp = _stream_response(req)
-            else:
-                resp = await _sync_response(req)
+        t = get_tracer()
+        with t.start_as_current_span("llm.request") as span:
+            span.set_attribute("llm.model", routed_model)
+            span.set_attribute("llm.tier", tier)
+            span.set_attribute("llm.stream", req.stream)
+            span.set_attribute("llm.max_tokens", req.max_tokens or 512)
+
+            with t.start_as_current_span("llm.queue.wait"):
+                async with _queue:
+                    pass
+
+            with t.start_as_current_span("llm.inference"):
+                if req.stream:
+                    resp = _stream_response(req)
+                else:
+                    resp = await _sync_response(req)
 
         if hasattr(resp, "headers"):
             resp.headers["X-Model-Tier"] = tier

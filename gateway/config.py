@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     max_requests_per_minute: int = 60
     max_tokens_per_minute: int = 10_000
 
+    # Tracing — disabled by default
+    # Set GATEWAY_TRACING_ENABLED="true" to enable
+    tracing_enabled: bool = False
+    otlp_endpoint: str = "http://localhost:4317"
+
     model_config = {"env_prefix": "GATEWAY_"}
 
     @property
