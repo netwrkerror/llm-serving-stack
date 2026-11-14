@@ -202,7 +202,7 @@ def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> S
                                     e2e = time.perf_counter() - arrival
                                     _record_backend_timings(inf_span, timings)
                                     REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
-                                    REQUEST_DURATION.labels(model=model, stream="true").observe(e2e)
+                                    REQUEST_DURATION.labels(model=model, stream="true", status="success").observe(e2e)
                                     TOKENS_GENERATED.labels(model=model).inc(token_count)
                                     THROUGHPUT.labels(model=model).observe(token_count / duration if duration > 0 else 0)
                                     log.info("request_completed", extra={
@@ -222,6 +222,9 @@ def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> S
                                     yield "data: [DONE]\n\n"
                         except Exception as exc:
                             REQUEST_COUNT.labels(model=model, status="error", stream="true").inc()
+                            REQUEST_DURATION.labels(model=model, stream="true", status="error").observe(
+                                time.perf_counter() - arrival
+                            )
                             log.error("request_failed", extra={"model": model, "error": str(exc)})
                             yield f"data: {json.dumps({'error': str(exc)})}\n\n"
                 finally:
@@ -249,6 +252,9 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float) 
                         text, prompt_tok, completion_tok, timings = await ollama_backend.generate(req)
                     except Exception as exc:
                         REQUEST_COUNT.labels(model=model, status="error", stream="false").inc()
+                        REQUEST_DURATION.labels(model=model, stream="false", status="error").observe(
+                            time.perf_counter() - arrival
+                        )
                         log.error("request_failed", extra={"model": model, "error": str(exc)})
                         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -257,7 +263,7 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float) 
                     e2e = time.perf_counter() - arrival
                     _record_backend_timings(inf_span, timings)
                     REQUEST_COUNT.labels(model=model, status="success", stream="false").inc()
-                    REQUEST_DURATION.labels(model=model, stream="false").observe(e2e)
+                    REQUEST_DURATION.labels(model=model, stream="false", status="success").observe(e2e)
                     TOKENS_GENERATED.labels(model=model).inc(completion_tok)
                     THROUGHPUT.labels(model=model).observe(completion_tok / duration if duration > 0 else 0)
                     log.info("request_completed", extra={

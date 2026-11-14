@@ -9,8 +9,9 @@ REQUEST_COUNT = Counter(
 REQUEST_DURATION = Histogram(
     "llm_request_duration_seconds",
     "End-to-end request duration: arrival to last byte, including queue wait. "
-    "Per-phase breakdown lives on the trace spans",
-    ["model", "stream"],
+    "Failures are recorded too — filter on status so a burst of fast errors "
+    "doesn't drag the success quantiles down. Per-phase breakdown is on the trace spans",
+    ["model", "stream", "status"],
     buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 10.0, 30.0, 60.0],
 )
 
