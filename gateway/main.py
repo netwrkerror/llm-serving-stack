@@ -120,6 +120,26 @@ def _set_span_attrs(span, req: ChatCompletionRequest, tier: str) -> None:
     span.set_attribute("llm.max_tokens", req.max_tokens or 512)
 
 
+def _record_backend_timings(span, timings: dict) -> None:
+    """Attach the backend's self-reported durations to the inference span.
+
+    Only Ollama reports these; OpenAI-compatible backends send nothing, so skip quietly.
+
+    unattributed_ms is total minus the phases Ollama attributes to this request. Measured
+    against OLLAMA_NUM_PARALLEL=1 vs 4, this is the term that tracks backend contention:
+    it goes from ~1ms on the first request to ~400ms on the last of four concurrent ones,
+    while each request's own eval time stays flat. Note total_duration already includes
+    that wait, so wall-clock-minus-total measures only HTTP overhead, not queueing.
+    """
+    if not timings:
+        return
+    for name, value in timings.items():
+        span.set_attribute(f"ollama.{name}", round(value, 2))
+    if "total_ms" in timings:
+        phases = sum(timings.get(k, 0.0) for k in ("load_ms", "prompt_eval_ms", "eval_ms"))
+        span.set_attribute("ollama.unattributed_ms", round(timings["total_ms"] - phases, 2))
+
+
 def _stream_response(req: ChatCompletionRequest, tier: str) -> StreamingResponse:
     model = req.model
 
@@ -133,13 +153,15 @@ def _stream_response(req: ChatCompletionRequest, tier: str) -> StreamingResponse
             with t.start_as_current_span("llm.queue.wait"):
                 await _queue.acquire()
             try:
-                with t.start_as_current_span("llm.inference"):
+                with t.start_as_current_span("llm.inference") as inf_span:
                     start = time.perf_counter()
                     first_token_recorded = False
                     try:
-                        async for token, done, token_count in ollama_backend.generate_stream(req):
+                        async for token, done, token_count, timings in ollama_backend.generate_stream(req):
                             if token and not first_token_recorded:
-                                TTFT.labels(model=model).observe(time.perf_counter() - start)
+                                ttft = time.perf_counter() - start
+                                TTFT.labels(model=model).observe(ttft)
+                                inf_span.add_event("first_token", {"ttft_ms": round(ttft * 1000, 2)})
                                 first_token_recorded = True
 
                             if token:
@@ -153,6 +175,7 @@ def _stream_response(req: ChatCompletionRequest, tier: str) -> StreamingResponse
 
                             if done:
                                 duration = time.perf_counter() - start
+                                _record_backend_timings(inf_span, timings)
                                 REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
                                 REQUEST_DURATION.labels(model=model, stream="true").observe(duration)
                                 TOKENS_GENERATED.labels(model=model).inc(token_count)
@@ -190,16 +213,17 @@ async def _sync_response(req: ChatCompletionRequest, tier: str) -> ChatCompletio
         with t.start_as_current_span("llm.queue.wait"):
             await _queue.acquire()
         try:
-            with t.start_as_current_span("llm.inference"):
+            with t.start_as_current_span("llm.inference") as inf_span:
                 start = time.perf_counter()
                 try:
-                    text, prompt_tok, completion_tok = await ollama_backend.generate(req)
+                    text, prompt_tok, completion_tok, timings = await ollama_backend.generate(req)
                 except Exception as exc:
                     REQUEST_COUNT.labels(model=model, status="error", stream="false").inc()
                     log.error("request_failed", extra={"model": model, "error": str(exc)})
                     raise HTTPException(status_code=500, detail=str(exc))
 
                 duration = time.perf_counter() - start
+                _record_backend_timings(inf_span, timings)
                 REQUEST_COUNT.labels(model=model, status="success", stream="false").inc()
                 REQUEST_DURATION.labels(model=model, stream="false").observe(duration)
                 TOKENS_GENERATED.labels(model=model).inc(completion_tok)

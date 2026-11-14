@@ -6,6 +6,25 @@ import httpx
 from .config import settings
 from .schemas import ChatCompletionRequest
 
+_NS_PER_MS = 1_000_000
+
+# Ollama reports these on its final response chunk, in nanoseconds. Other backends
+# (vLLM, TGI, anything OpenAI-compatible) don't, so callers must treat them as optional.
+_TIMING_FIELDS = {
+    "total_duration": "total_ms",
+    "load_duration": "load_ms",
+    "prompt_eval_duration": "prompt_eval_ms",
+    "eval_duration": "eval_ms",
+}
+
+
+def _extract_timings(data: dict) -> dict[str, float]:
+    return {
+        name: data[field] / _NS_PER_MS
+        for field, name in _TIMING_FIELDS.items()
+        if isinstance(data.get(field), (int, float))
+    }
+
 
 class OllamaBackend:
     def __init__(self) -> None:
@@ -51,17 +70,25 @@ class OllamaBackend:
             payload["system"] = system_prompt
         return payload
 
-    async def generate(self, req: ChatCompletionRequest) -> tuple[str, int, int]:
-        """Non-streaming. Returns (text, prompt_tokens, completion_tokens)."""
+    async def generate(self, req: ChatCompletionRequest) -> tuple[str, int, int, dict]:
+        """Non-streaming. Returns (text, prompt_tokens, completion_tokens, timings)."""
         payload = self._to_ollama_payload(req)
         payload["stream"] = False
         resp = await self.client.post("/api/generate", json=payload)
         resp.raise_for_status()
         data = resp.json()
-        return data["response"], data.get("prompt_eval_count", 0), data.get("eval_count", 0)
+        return (
+            data["response"],
+            data.get("prompt_eval_count", 0),
+            data.get("eval_count", 0),
+            _extract_timings(data),
+        )
 
-    async def generate_stream(self, req: ChatCompletionRequest) -> AsyncIterator[tuple[str, bool, int]]:
-        """Streaming. Yields (token, is_done, cumulative_token_count)."""
+    async def generate_stream(self, req: ChatCompletionRequest) -> AsyncIterator[tuple[str, bool, int, dict]]:
+        """Streaming. Yields (token, is_done, cumulative_token_count, timings).
+
+        timings is empty except on the final chunk, where Ollama reports its own durations.
+        """
         payload = self._to_ollama_payload(req)
         payload["stream"] = True
         token_count = 0
@@ -76,7 +103,7 @@ class OllamaBackend:
                     done = data.get("done", False)
                     if token:
                         token_count += 1
-                    yield token, done, token_count
+                    yield token, done, token_count, _extract_timings(data) if done else {}
                     if done:
                         break
                 except json.JSONDecodeError:
