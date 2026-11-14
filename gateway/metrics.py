@@ -15,9 +15,9 @@ REQUEST_DURATION = Histogram(
 
 TTFT = Histogram(
     "llm_time_to_first_token_seconds",
-    "Time to first token (streaming only)",
+    "Time from request arrival to the first streamed token, including queue wait",
     ["model"],
-    buckets=[0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0],
+    buckets=[0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0],
 )
 
 TOKENS_GENERATED = Counter(

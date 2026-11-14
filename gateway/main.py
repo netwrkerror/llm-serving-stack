@@ -91,6 +91,7 @@ async def prometheus_metrics():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
+    arrival = time.perf_counter()
     api_key = request.headers.get("Authorization", "")[len("Bearer "):].strip() or "anonymous"
 
     allowed, reason = rate_limiter.check_request(api_key)
@@ -108,7 +109,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     log.info("request_received", extra={"model": routed_model, "tier": tier, "stream": req.stream})
 
     if req.stream:
-        resp: Response = _stream_response(req, tier)
+        resp: Response = _stream_response(req, tier, arrival)
     else:
         # JSONResponse rather than the Pydantic model directly, so the headers below
         # apply to both paths.
@@ -155,7 +156,7 @@ def _record_backend_timings(span, timings: dict) -> None:
         span.set_attribute("ollama.unattributed_ms", round(timings["total_ms"] - phases, 2))
 
 
-def _stream_response(req: ChatCompletionRequest, tier: str) -> StreamingResponse:
+def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> StreamingResponse:
     model = req.model
 
     # The handler returns this StreamingResponse before the generator body runs, so the
@@ -176,9 +177,14 @@ def _stream_response(req: ChatCompletionRequest, tier: str) -> StreamingResponse
                         try:
                             async for token, done, token_count, timings in ollama_backend.generate_stream(req):
                                 if token and not first_token_recorded:
-                                    ttft = time.perf_counter() - start
+                                    # From arrival, not from generation start: queue wait is
+                                    # latency the caller actually feels.
+                                    ttft = time.perf_counter() - arrival
                                     TTFT.labels(model=model).observe(ttft)
-                                    inf_span.add_event("first_token", {"ttft_ms": round(ttft * 1000, 2)})
+                                    inf_span.add_event("first_token", {
+                                        "ttft_ms": round(ttft * 1000, 2),
+                                        "since_generation_start_ms": round((time.perf_counter() - start) * 1000, 2),
+                                    })
                                     first_token_recorded = True
 
                                 if token:
