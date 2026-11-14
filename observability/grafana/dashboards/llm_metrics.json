@@ -24,14 +24,19 @@
     },
     {
       "id": 2,
-      "title": "Active Requests (queue depth)",
+      "title": "In-flight vs Queued",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "targets": [
         {
           "datasource": "Prometheus",
           "expr": "sum(llm_active_requests) by (model)",
-          "legendFormat": "{{model}}"
+          "legendFormat": "in-flight {{model}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(llm_queue_waiting_requests) by (model)",
+          "legendFormat": "queued {{model}}"
         }
       ],
       "fieldConfig": {

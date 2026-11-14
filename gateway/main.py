@@ -15,7 +15,15 @@ from .backend import ollama_backend
 from .config import settings
 from .limiter import rate_limiter
 from .logger import log
-from .metrics import ACTIVE_REQUESTS, REQUEST_COUNT, REQUEST_DURATION, THROUGHPUT, TOKENS_GENERATED, TTFT
+from .metrics import (
+    IN_FLIGHT,
+    QUEUE_WAITING,
+    REQUEST_COUNT,
+    REQUEST_DURATION,
+    THROUGHPUT,
+    TOKENS_GENERATED,
+    TTFT,
+)
 from .router import classify, select_model
 from .tracing import get_tracer, setup_tracing
 from .schemas import (
@@ -98,19 +106,25 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     req = req.model_copy(update={"model": routed_model})
 
     log.info("request_received", extra={"model": routed_model, "tier": tier, "stream": req.stream})
-    ACTIVE_REQUESTS.labels(model=routed_model).inc()
-    try:
-        if req.stream:
-            resp = _stream_response(req, tier)
-        else:
-            resp = await _sync_response(req, tier)
 
-        if hasattr(resp, "headers"):
-            resp.headers["X-Model-Tier"] = tier
-            resp.headers["X-Routed-Model"] = routed_model
-        return resp
+    if req.stream:
+        resp = _stream_response(req, tier)
+    else:
+        resp = await _sync_response(req, tier)
+
+    if hasattr(resp, "headers"):
+        resp.headers["X-Model-Tier"] = tier
+        resp.headers["X-Routed-Model"] = routed_model
+    return resp
+
+
+async def _acquire_slot(model: str) -> None:
+    """Wait for a queue slot, counting this request as queued while it blocks."""
+    QUEUE_WAITING.labels(model=model).inc()
+    try:
+        await _queue.acquire()
     finally:
-        ACTIVE_REQUESTS.labels(model=routed_model).dec()
+        QUEUE_WAITING.labels(model=model).dec()
 
 
 def _set_span_attrs(span, req: ChatCompletionRequest, tier: str) -> None:
@@ -147,59 +161,63 @@ def _stream_response(req: ChatCompletionRequest, tier: str) -> StreamingResponse
     # queue slot has to be acquired here and held until the final chunk is yielded.
     async def event_stream() -> AsyncIterator[str]:
         t = get_tracer()
-        with t.start_as_current_span("llm.request") as span:
-            _set_span_attrs(span, req, tier)
+        IN_FLIGHT.labels(model=model).inc()
+        try:
+            with t.start_as_current_span("llm.request") as span:
+                _set_span_attrs(span, req, tier)
 
-            with t.start_as_current_span("llm.queue.wait"):
-                await _queue.acquire()
-            try:
-                with t.start_as_current_span("llm.inference") as inf_span:
-                    start = time.perf_counter()
-                    first_token_recorded = False
-                    try:
-                        async for token, done, token_count, timings in ollama_backend.generate_stream(req):
-                            if token and not first_token_recorded:
-                                ttft = time.perf_counter() - start
-                                TTFT.labels(model=model).observe(ttft)
-                                inf_span.add_event("first_token", {"ttft_ms": round(ttft * 1000, 2)})
-                                first_token_recorded = True
+                with t.start_as_current_span("llm.queue.wait"):
+                    await _acquire_slot(model)
+                try:
+                    with t.start_as_current_span("llm.inference") as inf_span:
+                        start = time.perf_counter()
+                        first_token_recorded = False
+                        try:
+                            async for token, done, token_count, timings in ollama_backend.generate_stream(req):
+                                if token and not first_token_recorded:
+                                    ttft = time.perf_counter() - start
+                                    TTFT.labels(model=model).observe(ttft)
+                                    inf_span.add_event("first_token", {"ttft_ms": round(ttft * 1000, 2)})
+                                    first_token_recorded = True
 
-                            if token:
-                                chunk = {
-                                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                                    "object": "chat.completion.chunk",
-                                    "model": model,
-                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}],
-                                }
-                                yield f"data: {json.dumps(chunk)}\n\n"
+                                if token:
+                                    chunk = {
+                                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                        "object": "chat.completion.chunk",
+                                        "model": model,
+                                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(chunk)}\n\n"
 
-                            if done:
-                                duration = time.perf_counter() - start
-                                _record_backend_timings(inf_span, timings)
-                                REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
-                                REQUEST_DURATION.labels(model=model, stream="true").observe(duration)
-                                TOKENS_GENERATED.labels(model=model).inc(token_count)
-                                THROUGHPUT.labels(model=model).observe(token_count / duration if duration > 0 else 0)
-                                log.info("request_completed", extra={
-                                    "model": model, "stream": True,
-                                    "duration_s": round(duration, 3),
-                                    "tokens": token_count,
-                                    "tps": round(token_count / duration if duration > 0 else 0, 1),
-                                })
-                                final = {
-                                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                                    "object": "chat.completion.chunk",
-                                    "model": model,
-                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                                }
-                                yield f"data: {json.dumps(final)}\n\n"
-                                yield "data: [DONE]\n\n"
-                    except Exception as exc:
-                        REQUEST_COUNT.labels(model=model, status="error", stream="true").inc()
-                        log.error("request_failed", extra={"model": model, "error": str(exc)})
-                        yield f"data: {json.dumps({'error': str(exc)})}\n\n"
-            finally:
-                _queue.release()
+                                if done:
+                                    duration = time.perf_counter() - start
+                                    _record_backend_timings(inf_span, timings)
+                                    REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
+                                    REQUEST_DURATION.labels(model=model, stream="true").observe(duration)
+                                    TOKENS_GENERATED.labels(model=model).inc(token_count)
+                                    THROUGHPUT.labels(model=model).observe(token_count / duration if duration > 0 else 0)
+                                    log.info("request_completed", extra={
+                                        "model": model, "stream": True,
+                                        "duration_s": round(duration, 3),
+                                        "tokens": token_count,
+                                        "tps": round(token_count / duration if duration > 0 else 0, 1),
+                                    })
+                                    final = {
+                                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                        "object": "chat.completion.chunk",
+                                        "model": model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                    }
+                                    yield f"data: {json.dumps(final)}\n\n"
+                                    yield "data: [DONE]\n\n"
+                        except Exception as exc:
+                            REQUEST_COUNT.labels(model=model, status="error", stream="true").inc()
+                            log.error("request_failed", extra={"model": model, "error": str(exc)})
+                            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                finally:
+                    _queue.release()
+        finally:
+            IN_FLIGHT.labels(model=model).dec()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -207,41 +225,45 @@ def _stream_response(req: ChatCompletionRequest, tier: str) -> StreamingResponse
 async def _sync_response(req: ChatCompletionRequest, tier: str) -> ChatCompletionResponse:
     model = req.model
     t = get_tracer()
-    with t.start_as_current_span("llm.request") as span:
-        _set_span_attrs(span, req, tier)
+    IN_FLIGHT.labels(model=model).inc()
+    try:
+        with t.start_as_current_span("llm.request") as span:
+            _set_span_attrs(span, req, tier)
 
-        with t.start_as_current_span("llm.queue.wait"):
-            await _queue.acquire()
-        try:
-            with t.start_as_current_span("llm.inference") as inf_span:
-                start = time.perf_counter()
-                try:
-                    text, prompt_tok, completion_tok, timings = await ollama_backend.generate(req)
-                except Exception as exc:
-                    REQUEST_COUNT.labels(model=model, status="error", stream="false").inc()
-                    log.error("request_failed", extra={"model": model, "error": str(exc)})
-                    raise HTTPException(status_code=500, detail=str(exc))
+            with t.start_as_current_span("llm.queue.wait"):
+                await _acquire_slot(model)
+            try:
+                with t.start_as_current_span("llm.inference") as inf_span:
+                    start = time.perf_counter()
+                    try:
+                        text, prompt_tok, completion_tok, timings = await ollama_backend.generate(req)
+                    except Exception as exc:
+                        REQUEST_COUNT.labels(model=model, status="error", stream="false").inc()
+                        log.error("request_failed", extra={"model": model, "error": str(exc)})
+                        raise HTTPException(status_code=500, detail=str(exc))
 
-                duration = time.perf_counter() - start
-                _record_backend_timings(inf_span, timings)
-                REQUEST_COUNT.labels(model=model, status="success", stream="false").inc()
-                REQUEST_DURATION.labels(model=model, stream="false").observe(duration)
-                TOKENS_GENERATED.labels(model=model).inc(completion_tok)
-                THROUGHPUT.labels(model=model).observe(completion_tok / duration if duration > 0 else 0)
-                log.info("request_completed", extra={
-                    "model": model, "stream": False,
-                    "duration_s": round(duration, 3),
-                    "tokens": completion_tok,
-                    "tps": round(completion_tok / duration if duration > 0 else 0, 1),
-                })
-                return ChatCompletionResponse(
-                    model=model,
-                    choices=[ChatCompletionChoice(message=ChatMessage(role="assistant", content=text))],
-                    usage=Usage(
-                        prompt_tokens=prompt_tok,
-                        completion_tokens=completion_tok,
-                        total_tokens=prompt_tok + completion_tok,
-                    ),
-                )
-        finally:
-            _queue.release()
+                    duration = time.perf_counter() - start
+                    _record_backend_timings(inf_span, timings)
+                    REQUEST_COUNT.labels(model=model, status="success", stream="false").inc()
+                    REQUEST_DURATION.labels(model=model, stream="false").observe(duration)
+                    TOKENS_GENERATED.labels(model=model).inc(completion_tok)
+                    THROUGHPUT.labels(model=model).observe(completion_tok / duration if duration > 0 else 0)
+                    log.info("request_completed", extra={
+                        "model": model, "stream": False,
+                        "duration_s": round(duration, 3),
+                        "tokens": completion_tok,
+                        "tps": round(completion_tok / duration if duration > 0 else 0, 1),
+                    })
+                    return ChatCompletionResponse(
+                        model=model,
+                        choices=[ChatCompletionChoice(message=ChatMessage(role="assistant", content=text))],
+                        usage=Usage(
+                            prompt_tokens=prompt_tok,
+                            completion_tokens=completion_tok,
+                            total_tokens=prompt_tok + completion_tok,
+                        ),
+                    )
+            finally:
+                _queue.release()
+    finally:
+        IN_FLIGHT.labels(model=model).dec()
