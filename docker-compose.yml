@@ -17,6 +17,29 @@ services:
     depends_on:
       - jaeger
 
+  loki:
+    image: grafana/loki:3.2.0
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/loki.yml:/etc/loki/loki.yml:ro
+    command: -config.file=/etc/loki/loki.yml
+    networks:
+      - stack
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.2.0
+    volumes:
+      - ./observability/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/promtail.yml
+    networks:
+      - stack
+    restart: unless-stopped
+    depends_on:
+      - loki
+
   jaeger:
     image: jaegertracing/all-in-one:latest
     ports:

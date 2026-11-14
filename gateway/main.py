@@ -14,6 +14,7 @@ from .auth import APIKeyMiddleware
 from .backend import ollama_backend
 from .config import settings
 from .limiter import rate_limiter
+from .logger import log
 from .metrics import ACTIVE_REQUESTS, REQUEST_COUNT, REQUEST_DURATION, THROUGHPUT, TOKENS_GENERATED, TTFT
 from .router import classify, select_model
 from .tracing import get_tracer, setup_tracing
@@ -31,13 +32,14 @@ _queue = asyncio.Semaphore(settings.max_concurrent_requests)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_tracing()
-    print("LLM Inference Gateway starting")
-    print(f"  backend  : {settings.ollama_base_url}")
-    print(f"  queue    : {settings.max_concurrent_requests} concurrent slots")
-    print(f"  tracing  : {'enabled → ' + settings.otlp_endpoint if settings.tracing_enabled else 'disabled'}")
+    log.info("gateway_starting", extra={
+        "backend": settings.ollama_base_url,
+        "queue_slots": settings.max_concurrent_requests,
+        "tracing": settings.tracing_enabled,
+    })
     yield
     await ollama_backend.close()
-    print("Gateway stopped")
+    log.info("gateway_stopped")
 
 
 app = FastAPI(
@@ -95,6 +97,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     tier = classify(req)
     req = req.model_copy(update={"model": routed_model})
 
+    log.info("request_received", extra={"model": routed_model, "tier": tier, "stream": req.stream})
     ACTIVE_REQUESTS.labels(model=routed_model).inc()
     try:
         t = get_tracer()
@@ -174,6 +177,12 @@ async def _sync_response(req: ChatCompletionRequest) -> ChatCompletionResponse:
         REQUEST_DURATION.labels(model=model, stream="false").observe(duration)
         TOKENS_GENERATED.labels(model=model).inc(completion_tok)
         THROUGHPUT.labels(model=model).observe(completion_tok / duration if duration > 0 else 0)
+        log.info("request_completed", extra={
+            "model": model, "stream": False,
+            "duration_s": round(duration, 3),
+            "tokens": completion_tok,
+            "tps": round(completion_tok / duration if duration > 0 else 0, 1),
+        })
         return ChatCompletionResponse(
             model=model,
             choices=[ChatCompletionChoice(message=ChatMessage(role="assistant", content=text))],
@@ -185,4 +194,5 @@ async def _sync_response(req: ChatCompletionRequest) -> ChatCompletionResponse:
         )
     except Exception as exc:
         REQUEST_COUNT.labels(model=model, status="error", stream="false").inc()
+        log.error("request_failed", extra={"model": model, "error": str(exc)})
         raise HTTPException(status_code=500, detail=str(exc))
