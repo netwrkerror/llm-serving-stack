@@ -26,6 +26,19 @@ def _extract_timings(data: dict) -> dict[str, float]:
     }
 
 
+def _extract_usage(data: dict) -> dict[str, int]:
+    """Token counts from Ollama's final chunk. Empty if the backend omits them."""
+    prompt = data.get("prompt_eval_count")
+    completion = data.get("eval_count")
+    if not isinstance(prompt, int) or not isinstance(completion, int):
+        return {}
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+
+
 class OllamaBackend:
     def __init__(self) -> None:
         self.client = httpx.AsyncClient(
@@ -85,9 +98,10 @@ class OllamaBackend:
         )
 
     async def generate_stream(self, req: ChatCompletionRequest) -> AsyncIterator[tuple[str, bool, int, dict]]:
-        """Streaming. Yields (token, is_done, cumulative_token_count, timings).
+        """Streaming. Yields (token, is_done, cumulative_token_count, meta).
 
-        timings is empty except on the final chunk, where Ollama reports its own durations.
+        meta is empty except on the final chunk, where it carries {"timings", "usage"}
+        from what the backend reported. Either key may be absent.
         """
         payload = self._to_ollama_payload(req)
         payload["stream"] = True
@@ -103,7 +117,8 @@ class OllamaBackend:
                     done = data.get("done", False)
                     if token:
                         token_count += 1
-                    yield token, done, token_count, _extract_timings(data) if done else {}
+                    meta = {"timings": _extract_timings(data), "usage": _extract_usage(data)} if done else {}
+                    yield token, done, token_count, meta
                     if done:
                         break
                 except json.JSONDecodeError:

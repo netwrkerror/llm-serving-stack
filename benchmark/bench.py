@@ -53,6 +53,9 @@ class Result:
     ttft: float | None
     tokens: int
     success: bool
+    # True when the count came from the gateway's usage block rather than
+    # from counting chunks, which is approximate.
+    tokens_exact: bool = False
 
 
 async def call(client: httpx.AsyncClient, gateway: str, model: str, stream: bool,
@@ -65,7 +68,8 @@ async def call(client: httpx.AsyncClient, gateway: str, model: str, stream: bool
     }
     start = time.perf_counter()
     ttft = None
-    tokens = 0
+    chunk_tokens = 0
+    reported_tokens = None
     try:
         if stream:
             async with client.stream("POST", f"{gateway}/v1/chat/completions", json=payload) as resp:
@@ -80,21 +84,26 @@ async def call(client: httpx.AsyncClient, gateway: str, model: str, stream: bool
                         chunk = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
+                    usage = chunk.get("usage")
+                    if usage and usage.get("completion_tokens") is not None:
+                        reported_tokens = usage["completion_tokens"]
                     choices = chunk.get("choices")
                     if not choices:
                         continue
                     if choices[0].get("delta", {}).get("content"):
-                        # one chunk is one token from the backend; splitting on
-                        # whitespace undercounts, since most tokens are sub-word
-                        tokens += 1
+                        # Fallback only. A chunk is not guaranteed to be one token —
+                        # OpenAI-compatible backends may pack several into one.
+                        chunk_tokens += 1
                         if ttft is None:
                             ttft = time.perf_counter() - start
-        else:
-            resp = await client.post(f"{gateway}/v1/chat/completions", json=payload)
-            resp.raise_for_status()
-            tokens = resp.json()["usage"]["completion_tokens"]
+            exact = reported_tokens is not None
+            return Result(time.perf_counter() - start, ttft,
+                          reported_tokens if exact else chunk_tokens, True, exact)
 
-        return Result(time.perf_counter() - start, ttft, tokens, True)
+        resp = await client.post(f"{gateway}/v1/chat/completions", json=payload)
+        resp.raise_for_status()
+        return Result(time.perf_counter() - start, ttft,
+                      resp.json()["usage"]["completion_tokens"], True, True)
     except Exception as exc:
         print(f"    error: {exc}")
         return Result(time.perf_counter() - start, None, 0, False)
@@ -136,7 +145,10 @@ async def scenario(label: str, gateway: str, model: str, n: int, stream: bool,
     print(f"  throughput    : {len(ok) / wall:.2f} req/s")
     print(f"  latency p50   : {percentile(durations, 0.50):.2f}s")
     print(f"  latency p95   : {percentile(durations, 0.95):.2f}s")
-    print(f"  total tokens  : {total_tok}")
+    source = ("backend usage" if all(r.tokens_exact for r in ok)
+              else "chunk count, approximate" if not any(r.tokens_exact for r in ok)
+              else "mixed: some usage, some chunk count")
+    print(f"  total tokens  : {total_tok}  ({source})")
     print(f"  tokens/sec    : {total_tok / wall:.1f}")
     if ttfts:
         print(f"  TTFT p50      : {percentile(ttfts, 0.50):.3f}s")

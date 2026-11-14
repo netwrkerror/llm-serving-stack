@@ -179,7 +179,7 @@ def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> S
                         start = time.perf_counter()
                         first_token_recorded = False
                         try:
-                            async for token, done, token_count, timings in ollama_backend.generate_stream(req):
+                            async for token, done, token_count, meta in ollama_backend.generate_stream(req):
                                 if token and not first_token_recorded:
                                     # From arrival, not from generation start: queue wait is
                                     # latency the caller actually feels.
@@ -204,7 +204,7 @@ def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> S
                                     # generation time drives throughput; end-to-end drives latency
                                     duration = time.perf_counter() - start
                                     e2e = time.perf_counter() - arrival
-                                    _record_backend_timings(inf_span, timings)
+                                    _record_backend_timings(inf_span, meta.get("timings", {}))
                                     REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
                                     REQUEST_DURATION.labels(model=model, stream="true", status="success").observe(e2e)
                                     TOKENS_GENERATED.labels(model=model).inc(token_count)
@@ -223,6 +223,19 @@ def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> S
                                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                                     }
                                     yield f"data: {json.dumps(final)}\n\n"
+
+                                    # Separate usage chunk with empty choices, the shape the
+                                    # OpenAI API uses for stream_options.include_usage. Chunk
+                                    # counting is approximate; the backend's own count is not.
+                                    usage = meta.get("usage", {})
+                                    if usage:
+                                        yield "data: " + json.dumps({
+                                            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                            "object": "chat.completion.chunk",
+                                            "model": model,
+                                            "choices": [],
+                                            "usage": usage,
+                                        }) + "\n\n"
                                     yield "data: [DONE]\n\n"
                         except Exception as exc:
                             REQUEST_COUNT.labels(model=model, status="error", stream="true").inc()
