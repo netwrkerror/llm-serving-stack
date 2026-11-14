@@ -69,7 +69,11 @@ app.add_middleware(
 @app.get("/health")
 async def health():
     ok = await ollama_backend.health_check()
-    return {"status": "ok" if ok else "degraded", "backend": settings.ollama_base_url}
+    return {
+        "status": "ok" if ok else "degraded",
+        "backend": settings.ollama_base_url,
+        "queue_slots": settings.max_concurrent_requests,
+    }
 
 
 @app.get("/v1/models")
