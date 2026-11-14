@@ -1,8 +1,16 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    ollama_base_url: str = "http://localhost:11434"
+    # "ollama" speaks Ollama's native /api, "openai" speaks /v1/chat/completions
+    # (vLLM, TGI, Ollama's own /v1). The URL must match the chosen protocol:
+    # http://host:11434 for ollama, http://host:11434/v1 for openai.
+    backend: Literal["ollama", "openai"] = "ollama"
+    backend_url: str = "http://localhost:11434"
+    backend_api_key: str = ""
+
     default_model: str = "llama3.2:1b"
     max_concurrent_requests: int = 4
     request_timeout: float = 120.0

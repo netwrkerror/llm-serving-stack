@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .auth import APIKeyMiddleware
-from .backend import ollama_backend
+from .backend import backend
 from .config import settings
 from .limiter import rate_limiter
 from .logger import log
@@ -41,12 +41,13 @@ _queue = asyncio.Semaphore(settings.max_concurrent_requests)
 async def lifespan(app: FastAPI):
     setup_tracing()
     log.info("gateway_starting", extra={
-        "backend": settings.ollama_base_url,
+        "backend_kind": settings.backend,
+        "backend": settings.backend_url,
         "queue_slots": settings.max_concurrent_requests,
         "tracing": settings.tracing_enabled,
     })
     yield
-    await ollama_backend.close()
+    await backend.close()
     log.info("gateway_stopped")
 
 
@@ -68,10 +69,11 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    ok = await ollama_backend.health_check()
+    ok = await backend.health_check()
     return {
         "status": "ok" if ok else "degraded",
-        "backend": settings.ollama_base_url,
+        "backend": settings.backend_url,
+        "backend_kind": settings.backend,
         "queue_slots": settings.max_concurrent_requests,
     }
 
@@ -79,10 +81,10 @@ async def health():
 @app.get("/v1/models")
 async def list_models():
     try:
-        models = await ollama_backend.list_models()
+        models = await backend.list_models()
         return {
             "object": "list",
-            "data": [{"id": m["name"], "object": "model", "owned_by": "ollama"} for m in models],
+            "data": [{"id": m, "object": "model", "owned_by": settings.backend} for m in models],
         }
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -179,7 +181,7 @@ def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> S
                         start = time.perf_counter()
                         first_token_recorded = False
                         try:
-                            async for token, done, token_count, meta in ollama_backend.generate_stream(req):
+                            async for token, done, token_count, meta in backend.generate_stream(req):
                                 if token and not first_token_recorded:
                                     # From arrival, not from generation start: queue wait is
                                     # latency the caller actually feels.
@@ -266,7 +268,7 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float) 
                 with t.start_as_current_span("llm.inference") as inf_span:
                     start = time.perf_counter()
                     try:
-                        text, prompt_tok, completion_tok, timings = await ollama_backend.generate(req)
+                        text, prompt_tok, completion_tok, meta = await backend.generate(req)
                     except Exception as exc:
                         REQUEST_COUNT.labels(model=model, status="error", stream="false").inc()
                         REQUEST_DURATION.labels(model=model, stream="false", status="error").observe(
@@ -278,7 +280,7 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float) 
                     # generation time drives throughput; end-to-end drives latency
                     duration = time.perf_counter() - start
                     e2e = time.perf_counter() - arrival
-                    _record_backend_timings(inf_span, timings)
+                    _record_backend_timings(inf_span, meta.get("timings", {}))
                     REQUEST_COUNT.labels(model=model, status="success", stream="false").inc()
                     REQUEST_DURATION.labels(model=model, stream="false", status="success").observe(e2e)
                     TOKENS_GENERATED.labels(model=model).inc(completion_tok)

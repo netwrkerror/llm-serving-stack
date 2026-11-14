@@ -6,7 +6,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      GATEWAY_OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      # ollama = native /api; openai = /v1/chat/completions (vLLM, TGI, Ollama's own /v1).
+      # The URL must match: .../11434 for ollama, .../11434/v1 for openai.
+      GATEWAY_BACKEND: "ollama"
+      GATEWAY_BACKEND_URL: "http://host.docker.internal:11434"
       GATEWAY_DEFAULT_MODEL: "llama3.2:1b"
       GATEWAY_MAX_CONCURRENT_REQUESTS: "4"
       GATEWAY_TRACING_ENABLED: "true"
