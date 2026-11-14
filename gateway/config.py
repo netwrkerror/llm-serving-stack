@@ -36,7 +36,9 @@ class Settings(BaseSettings):
     tracing_enabled: bool = False
     otlp_endpoint: str = "http://localhost:4317"
 
-    model_config = {"env_prefix": "GATEWAY_"}
+    # model_fast/_balanced/_powerful collide with pydantic's reserved "model_" prefix;
+    # these are model names, not pydantic internals.
+    model_config = {"env_prefix": "GATEWAY_", "protected_namespaces": ()}
 
     @property
     def api_key_set(self) -> set[str]:

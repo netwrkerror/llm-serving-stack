@@ -147,11 +147,30 @@ for chunk in client.chat.completions.create(
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 
+### Tests
+
+```bash
+make test
+```
+
+Creates `.venv` on first run. Covers the rate limiter (per-key windows, both budgets,
+reset) and the auth middleware (missing/bad/valid keys, open paths). It does **not**
+cover the gateway's request path, backends, or metrics — those were verified by running
+the stack, not by tests.
+
 ### Benchmark
 
 ```bash
 python3 -m pip install httpx
 python3 benchmark/bench.py
+```
+
+For a full comparison run, use the suite script instead — it launches Ollama itself and
+aborts if `OLLAMA_NUM_PARALLEL` did not reach the server:
+
+```bash
+./benchmark/run_suite.sh 1    # then take screenshots
+./benchmark/run_suite.sh 4
 ```
 
 Measured results, with the conditions they were taken under, are in
@@ -296,7 +315,9 @@ llm-serving-stack/
 │   └── requirements.txt
 ├── benchmark/
 │   ├── bench.py        5-scenario benchmark
+│   ├── run_suite.sh    Full comparison run, aborts on a bad Ollama setting
 │   └── RESULTS.md      Measured numbers, with conditions
+├── tests/              Rate limiter and auth middleware (make test)
 ├── observability/
 │   ├── prometheus.yml
 │   ├── loki/           Log store config
