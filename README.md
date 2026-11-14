@@ -191,19 +191,37 @@ Open **http://localhost:3000** → Dashboards → **LLM Serving Stack**.
 
 ---
 
-## Swapping to a real GPU backend
+## Choosing a backend
 
-Change one env var in `docker-compose.yml`:
+`GATEWAY_BACKEND` selects the wire protocol, and `GATEWAY_BACKEND_URL` must match it:
+
+| | `ollama` (default) | `openai` |
+|---|---|---|
+| Endpoint | `/api/generate` | `/v1/chat/completions` |
+| URL form | `http://host:11434` | `http://host:11434/v1` |
+| Sends | a single prompt string | the `messages` list |
+| Backend timings on spans | yes | no |
 
 ```yaml
-# vLLM
-GATEWAY_OLLAMA_BASE_URL: "http://your-vllm-host:8000"
-
-# TGI
-GATEWAY_OLLAMA_BASE_URL: "http://your-tgi-host:80"
+# docker-compose.yml — Ollama's own OpenAI-compatible endpoint
+GATEWAY_BACKEND: "openai"
+GATEWAY_BACKEND_URL: "http://host.docker.internal:11434/v1"
+GATEWAY_BACKEND_API_KEY: ""   # if the backend requires one
 ```
 
-Everything else — API, metrics, dashboard — stays identical.
+Everything else — the gateway API, metrics, dashboard, traces — stays identical.
+
+**Prefer `openai` if prompt fidelity matters.** The `ollama` backend builds a
+`"User:/Assistant:"` string and posts it to `/api/generate`, which then applies the
+model's chat template *on top*, so those markers become literal text inside a single
+user turn. On `llama3.2:1b` that is 32 prompt tokens versus 27 via `/v1` for the same
+message, and multi-turn conversations collapse into one turn. The native path is kept
+because it exercises Ollama's own API and reports per-phase timings the OpenAI
+protocol has no field for.
+
+**Tested against Ollama's `/v1` only.** vLLM and TGI both speak this protocol, but
+neither has been run here — that is Part 3, on a rented GPU. Until then, treat vLLM
+and TGI support as untested.
 
 ---
 

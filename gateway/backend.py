@@ -77,6 +77,12 @@ class OllamaBackend:
         return [m["name"] for m in resp.json().get("models", []) if m.get("name")]
 
     def _to_ollama_payload(self, req: ChatCompletionRequest) -> dict:
+        # /api/generate applies the model's chat template to whatever string we pass, so
+        # these "User:/Assistant:" markers land as literal text inside a single templated
+        # user turn — double-wrapping. Measured on llama3.2:1b: 32 prompt tokens here vs
+        # 27 via /api/chat or /v1 for the same message. Multi-turn fares worse, since every
+        # turn collapses into one user message. Use GATEWAY_BACKEND=openai for faithful
+        # prompting; this path is kept to show the native API.
         system_prompt = None
         turns: list[str] = []
         for msg in req.messages:
