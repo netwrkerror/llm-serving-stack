@@ -5,9 +5,11 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from opentelemetry import trace as otel_trace
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .auth import APIKeyMiddleware
@@ -115,11 +117,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     log.info("request_received", extra={"model": routed_model, "tier": tier, "stream": req.stream})
 
     if req.stream:
-        resp: Response = _stream_response(req, tier, arrival)
+        resp: Response = await _stream_response(req, tier, arrival)
     else:
         # JSONResponse rather than the Pydantic model directly, so the headers below
         # apply to both paths.
-        resp = JSONResponse(content=(await _sync_response(req, tier, arrival)).model_dump())
+        try:
+            resp = JSONResponse(content=(await _sync_response(req, tier, arrival)).model_dump())
+        except _UpstreamFailure as fail:
+            resp = _openai_error(fail.status, fail.message, fail.err_type)
 
     resp.headers["X-Model-Tier"] = tier
     resp.headers["X-Routed-Model"] = routed_model
@@ -162,111 +167,193 @@ def _record_backend_timings(span, timings: dict) -> None:
         span.set_attribute("ollama.unattributed_ms", round(timings["total_ms"] - phases, 2))
 
 
-def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> StreamingResponse:
+class _UpstreamFailure(Exception):
+    """A backend failure that happened before any bytes were sent to the client,
+    so it can still be reported as a real HTTP status."""
+
+    def __init__(self, status: int, message: str, err_type: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.err_type = err_type
+
+
+def _classify_upstream(exc: Exception) -> tuple[int, str]:
+    """Map a backend exception onto the status the caller should see."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code == 404:
+            return 404, "model_not_found"
+        if code in (400, 401, 403, 422, 429):
+            return code, "upstream_error"
+        return 502, "upstream_error"
+    if isinstance(exc, httpx.TimeoutException):
+        return 504, "upstream_timeout"
+    if isinstance(exc, httpx.RequestError):
+        return 502, "upstream_unavailable"
+    return 500, "internal_error"
+
+
+def _openai_error(status: int, message: str, err_type: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"message": message, "type": err_type, "param": None, "code": None}},
+    )
+
+
+async def _prepend(first, rest: AsyncIterator) -> AsyncIterator:
+    yield first
+    async for item in rest:
+        yield item
+
+
+async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> Response:
+    """Open the backend stream and read its first chunk before returning a response.
+
+    Once a StreamingResponse is returned, the 200 and the SSE content-type are already
+    committed, so a failure after that can only be an error chunk. Pulling the first
+    chunk here means a dead backend or an unknown model still gets a real status code.
+    Failures after this point stay 200 + an error chunk, as the protocol requires.
+    """
     model = req.model
     # Absent stream_options means send usage; an explicit value wins either way.
     include_usage = req.stream_options.include_usage if req.stream_options else True
+    t = get_tracer()
 
-    # The handler returns this StreamingResponse before the generator body runs, so the
-    # queue slot has to be acquired here and held until the final chunk is yielded.
+    IN_FLIGHT.labels(model=model).inc()
+    span = t.start_span("llm.request")
+    _set_span_attrs(span, req, tier)
+
+    acquired = False
+    agen = None
+    inf_span = None
+    try:
+        with otel_trace.use_span(span, end_on_exit=False):
+            with t.start_as_current_span("llm.queue.wait"):
+                await _acquire_slot(model)
+            acquired = True
+            inf_span = t.start_span("llm.inference")
+            with otel_trace.use_span(inf_span, end_on_exit=False):
+                gen_start = time.perf_counter()
+                agen = backend.generate_stream(req)
+                first = await agen.__anext__()
+    except BaseException as exc:
+        if agen is not None:
+            await agen.aclose()
+        if acquired:
+            _queue.release()
+        IN_FLIGHT.labels(model=model).dec()
+        for s in (inf_span, span):
+            if s is not None:
+                if isinstance(exc, Exception):
+                    s.record_exception(exc)
+                s.end()
+        if not isinstance(exc, Exception):
+            raise
+
+        if isinstance(exc, StopAsyncIteration):
+            status, err_type, message = 502, "upstream_error", "backend produced no output"
+        else:
+            status, err_type = _classify_upstream(exc)
+            message = str(exc)
+
+        REQUEST_COUNT.labels(model=model, status="error", stream="true").inc()
+        REQUEST_DURATION.labels(model=model, stream="true", status="error").observe(
+            time.perf_counter() - arrival
+        )
+        log.error("request_failed", extra={"model": model, "error": message, "http_status": status})
+        return _openai_error(status, message, err_type)
+
     async def event_stream() -> AsyncIterator[str]:
-        t = get_tracer()
-        IN_FLIGHT.labels(model=model).inc()
+        first_token_recorded = False
         try:
-            with t.start_as_current_span("llm.request") as span:
-                _set_span_attrs(span, req, tier)
+            with otel_trace.use_span(span, end_on_exit=False):
+                with otel_trace.use_span(inf_span, end_on_exit=False):
+                    try:
+                        async for token, done, token_count, meta in _prepend(first, agen):
+                            if token and not first_token_recorded:
+                                # From arrival, not from generation start: queue wait is
+                                # latency the caller actually feels.
+                                ttft = time.perf_counter() - arrival
+                                TTFT.labels(model=model).observe(ttft)
+                                inf_span.add_event("first_token", {
+                                    "ttft_ms": round(ttft * 1000, 2),
+                                    "since_generation_start_ms": round((time.perf_counter() - gen_start) * 1000, 2),
+                                })
+                                first_token_recorded = True
 
-                with t.start_as_current_span("llm.queue.wait"):
-                    await _acquire_slot(model)
-                try:
-                    with t.start_as_current_span("llm.inference") as inf_span:
-                        start = time.perf_counter()
-                        first_token_recorded = False
-                        try:
-                            async for token, done, token_count, meta in backend.generate_stream(req):
-                                if token and not first_token_recorded:
-                                    # From arrival, not from generation start: queue wait is
-                                    # latency the caller actually feels.
-                                    ttft = time.perf_counter() - arrival
-                                    TTFT.labels(model=model).observe(ttft)
-                                    inf_span.add_event("first_token", {
-                                        "ttft_ms": round(ttft * 1000, 2),
-                                        "since_generation_start_ms": round((time.perf_counter() - start) * 1000, 2),
-                                    })
-                                    first_token_recorded = True
-
-                                if token:
-                                    chunk = {
-                                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                                        "object": "chat.completion.chunk",
-                                        "model": model,
-                                        "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}],
-                                    }
-                                    yield f"data: {json.dumps(chunk)}\n\n"
-
-                                if done:
-                                    # generation time drives throughput; end-to-end drives latency
-                                    duration = time.perf_counter() - start
-                                    e2e = time.perf_counter() - arrival
-                                    _record_backend_timings(inf_span, meta.get("timings", {}))
-                                    REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
-                                    REQUEST_DURATION.labels(model=model, stream="true", status="success").observe(e2e)
-                                    TOKENS_GENERATED.labels(model=model).inc(token_count)
-                                    THROUGHPUT.labels(model=model).observe(token_count / duration if duration > 0 else 0)
-                                    log.info("request_completed", extra={
-                                        "model": model, "stream": True,
-                                        "duration_s": round(e2e, 3),
-                                        "generation_s": round(duration, 3),
-                                        "tokens": token_count,
-                                        "tps": round(token_count / duration if duration > 0 else 0, 1),
-                                    })
-                                    final = {
-                                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                                        "object": "chat.completion.chunk",
-                                        "model": model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                                    }
-                                    yield f"data: {json.dumps(final)}\n\n"
-
-                                    # Separate usage chunk with empty choices, the shape the
-                                    # OpenAI API uses for stream_options.include_usage. Chunk
-                                    # counting is approximate; the backend's own count is not.
-                                    usage = meta.get("usage", {})
-                                    if usage and include_usage:
-                                        yield "data: " + json.dumps({
-                                            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                                            "object": "chat.completion.chunk",
-                                            "model": model,
-                                            "choices": [],
-                                            "usage": usage,
-                                        }) + "\n\n"
-                                    yield "data: [DONE]\n\n"
-                        except Exception as exc:
-                            REQUEST_COUNT.labels(model=model, status="error", stream="true").inc()
-                            REQUEST_DURATION.labels(model=model, stream="true", status="error").observe(
-                                time.perf_counter() - arrival
-                            )
-                            log.error("request_failed", extra={"model": model, "error": str(exc)})
-                            inf_span.record_exception(exc)
-                            # OpenAI's mid-stream error shape: a nested error object. The
-                            # SDK reads .message off it and raises APIError; a bare string
-                            # would surface as a generic "error occurred" instead.
-                            yield "data: " + json.dumps({
-                                "error": {
-                                    "message": str(exc),
-                                    "type": "upstream_error",
-                                    "param": None,
-                                    "code": None,
+                            if token:
+                                chunk = {
+                                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                    "object": "chat.completion.chunk",
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}],
                                 }
-                            }) + "\n\n"
-                            yield "data: [DONE]\n\n"
-                finally:
-                    _queue.release()
+                                yield f"data: {json.dumps(chunk)}\n\n"
+
+                            if done:
+                                # generation time drives throughput; end-to-end drives latency
+                                duration = time.perf_counter() - gen_start
+                                e2e = time.perf_counter() - arrival
+                                _record_backend_timings(inf_span, meta.get("timings", {}))
+                                REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
+                                REQUEST_DURATION.labels(model=model, stream="true", status="success").observe(e2e)
+                                TOKENS_GENERATED.labels(model=model).inc(token_count)
+                                THROUGHPUT.labels(model=model).observe(token_count / duration if duration > 0 else 0)
+                                log.info("request_completed", extra={
+                                    "model": model, "stream": True,
+                                    "duration_s": round(e2e, 3),
+                                    "generation_s": round(duration, 3),
+                                    "tokens": token_count,
+                                    "tps": round(token_count / duration if duration > 0 else 0, 1),
+                                })
+                                final = {
+                                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                    "object": "chat.completion.chunk",
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                }
+                                yield f"data: {json.dumps(final)}\n\n"
+
+                                # Separate usage chunk with empty choices, the shape the
+                                # OpenAI API uses for stream_options.include_usage. Chunk
+                                # counting is approximate; the backend's own count is not.
+                                usage = meta.get("usage", {})
+                                if usage and include_usage:
+                                    yield "data: " + json.dumps({
+                                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                        "object": "chat.completion.chunk",
+                                        "model": model,
+                                        "choices": [],
+                                        "usage": usage,
+                                    }) + "\n\n"
+                                yield "data: [DONE]\n\n"
+                    except Exception as exc:
+                        # Past the first chunk the status is already sent, so a failure
+                        # can only be reported in-band. OpenAI's nested error shape: the
+                        # SDK reads .message off it and raises APIError.
+                        REQUEST_COUNT.labels(model=model, status="error", stream="true").inc()
+                        REQUEST_DURATION.labels(model=model, stream="true", status="error").observe(
+                            time.perf_counter() - arrival
+                        )
+                        log.error("request_failed", extra={"model": model, "error": str(exc)})
+                        inf_span.record_exception(exc)
+                        yield "data: " + json.dumps({
+                            "error": {
+                                "message": str(exc),
+                                "type": "upstream_error",
+                                "param": None,
+                                "code": None,
+                            }
+                        }) + "\n\n"
+                        yield "data: [DONE]\n\n"
         finally:
+            _queue.release()
             IN_FLIGHT.labels(model=model).dec()
+            inf_span.end()
+            span.end()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
-
 
 async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float) -> ChatCompletionResponse:
     model = req.model
@@ -288,8 +375,12 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float) 
                         REQUEST_DURATION.labels(model=model, stream="false", status="error").observe(
                             time.perf_counter() - arrival
                         )
-                        log.error("request_failed", extra={"model": model, "error": str(exc)})
-                        raise HTTPException(status_code=500, detail=str(exc))
+                        status, err_type = _classify_upstream(exc)
+                        log.error("request_failed", extra={
+                            "model": model, "error": str(exc), "http_status": status,
+                        })
+                        inf_span.record_exception(exc)
+                        raise _UpstreamFailure(status, str(exc), err_type)
 
                     # generation time drives throughput; end-to-end drives latency
                     duration = time.perf_counter() - start
