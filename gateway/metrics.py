@@ -28,13 +28,15 @@ TOKENS_GENERATED = Counter(
 
 IN_FLIGHT = Gauge(
     "llm_active_requests",
-    "Requests in flight: accepted and not yet fully returned, counting streaming until the last chunk",
+    "Requests accepted and not yet fully returned, streaming counted until the last chunk. "
+    "Includes those still waiting for a slot: in-flight = waiting + running",
     ["model"],
 )
 
 QUEUE_WAITING = Gauge(
     "llm_queue_waiting_requests",
-    "Requests blocked waiting to acquire a queue slot",
+    "Requests blocked waiting to acquire a queue slot. "
+    "Subtract from llm_active_requests to get the number actually generating",
     ["model"],
 )
 

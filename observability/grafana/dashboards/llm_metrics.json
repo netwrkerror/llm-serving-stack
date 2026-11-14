@@ -24,7 +24,8 @@
     },
     {
       "id": 2,
-      "title": "In-flight vs Queued",
+      "title": "In-flight = waiting + running",
+      "description": "in-flight counts every accepted request, including those still queued for a slot. running is the derived difference — the ones actually generating.",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "targets": [
@@ -36,7 +37,12 @@
         {
           "datasource": "Prometheus",
           "expr": "sum(llm_queue_waiting_requests) by (model)",
-          "legendFormat": "queued {{model}}"
+          "legendFormat": "waiting {{model}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(llm_active_requests) by (model) - sum(llm_queue_waiting_requests) by (model)",
+          "legendFormat": "running {{model}}"
         }
       ],
       "fieldConfig": {
