@@ -44,11 +44,18 @@ Client (curl / Python / OpenAI SDK)
 |---------|-----------|--------------|
 | OpenAI-compatible API | ✓ | ✓ |
 | SSE streaming | ✓ | ✓ |
-| Request queue | PagedAttention scheduler | `asyncio.Semaphore` |
-| TTFT metric | Internal | Prometheus histogram |
-| Tokens per second | Internal | Prometheus histogram |
+| Admission control | continuous-batching scheduler | `asyncio.Semaphore`, fixed slot count |
+| Batching | several sequences share a forward pass | none — the backend decides |
+| KV-cache memory | PagedAttention | not managed here |
+| TTFT metric | internal | Prometheus histogram |
+| Tokens per second | internal | Prometheus histogram |
 | Health endpoint | ✓ | `/health` |
 | Prometheus metrics | ✓ | `/metrics` |
+
+The semaphore is admission control, not batching. It caps how many requests reach the
+backend at once; it cannot make them share a forward pass. PagedAttention is a separate
+idea again — it is how vLLM manages KV-cache memory in pages so more sequences fit in
+VRAM, which is what makes aggressive batching practical.
 
 ---
 
@@ -56,13 +63,13 @@ Client (curl / Python / OpenAI SDK)
 
 | Layer | What it does |
 |-------|-------------|
-| `gateway/` | FastAPI app — request queuing, sync + streaming inference, Prometheus metrics |
-| `observability/` | Prometheus scrape config + auto-provisioned Grafana dashboard |
-| `benchmark/` | 4-scenario load test (sequential vs concurrent, sync vs streaming) |
-| Routing _(coming)_ | Multi-model routing based on prompt complexity |
-| Auth _(coming)_ | API key middleware |
-| Rate limiting _(coming)_ | Per-key token budget + requests/min cap |
-| Tracing _(coming)_ | OpenTelemetry spans → Jaeger / Tempo |
+| `gateway/` | FastAPI app — admission control, sync + streaming inference, routing, auth, rate limiting |
+| `observability/` | Prometheus + Grafana, Jaeger traces, Loki/Promtail logs |
+| `benchmark/` | 5-scenario load test, ending oversubscribed so gateway queueing shows up |
+| Routing | Model tier chosen from prompt complexity; `X-Model-Tier` on the response |
+| Auth | API key middleware — **off by default**, set `GATEWAY_AUTH_ENABLED` and `GATEWAY_API_KEYS` |
+| Rate limiting | Per-key requests/min and token budget — **off by default**, set `GATEWAY_RATE_LIMIT_ENABLED` |
+| Tracing | OpenTelemetry spans — **tested with Jaeger only**; any OTLP collector should work, untested |
 
 ---
 
@@ -88,8 +95,10 @@ docker compose up --build
 | Service | URL |
 |---------|-----|
 | Gateway API docs | http://localhost:8000/docs |
-| Prometheus | http://localhost:9090 |
 | Grafana | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
+| Jaeger | http://localhost:16686 |
+| Loki | http://localhost:3100 (query via Grafana) |
 
 Stop and resume:
 ```bash
@@ -178,16 +187,61 @@ logs to stdout, wherever you redirect it.
 
 ## Observability
 
-Open **http://localhost:3000** → Dashboards → **LLM Serving Stack**.
+All three signals, correlated: a log line carries the `trace_id` of its trace.
+
+| Signal | Where | What |
+|--------|-------|------|
+| Metrics | Grafana, http://localhost:3000 → **LLM Serving Stack** | rates, latency, TTFT, queue depth |
+| Traces | Jaeger, http://localhost:16686 → service `llm-serving-stack` | per-request span waterfall |
+| Logs | Grafana → Explore → Loki, `{container=~".*gateway.*"}` | structured JSON with `trace_id` |
+
+### Metrics
 
 | Metric | Description |
 |--------|-------------|
-| `llm_requests_total` | Request rate by status |
-| `llm_active_requests` | Live queue depth |
-| `llm_request_duration_seconds` | End-to-end latency histogram (p50 / p95) |
-| `llm_time_to_first_token_seconds` | TTFT — key UX metric for streaming |
-| `llm_tokens_per_second` | Generation throughput |
+| `llm_requests_total` | Request count by model, status, stream |
+| `llm_active_requests` | In-flight: accepted and not yet fully returned, **including those waiting for a slot** |
+| `llm_queue_waiting_requests` | Blocked waiting for a slot. In-flight minus this is the number actually generating |
+| `llm_request_duration_seconds` | End-to-end, arrival to last byte, including queue wait. Labelled by `status` so failures are separable |
+| `llm_time_to_first_token_seconds` | Arrival to first streamed token, **including queue wait** |
+| `llm_tokens_per_second` | Generation throughput, excluding queue wait |
 | `llm_tokens_generated_total` | Cumulative token count |
+
+### Trace spans
+
+Each request produces three spans: `llm.request` wraps `llm.queue.wait` (time to acquire
+a slot) and `llm.inference` (generation). `llm.inference` carries a `first_token` event
+and, on the Ollama backend, the backend's own phase timings:
+
+| Attribute | Meaning |
+|-----------|---------|
+| `ollama.total_ms` | What Ollama reports for the whole call — **includes its own queue wait** |
+| `ollama.load_ms` / `prompt_eval_ms` / `eval_ms` | Per-phase breakdown |
+| `ollama.unattributed_ms` | `total` minus those phases. Tracks backend contention: ~1 ms for an uncontended request, ~400 ms for the last of four when `OLLAMA_NUM_PARALLEL=1` |
+
+---
+
+## Configuration
+
+Everything is `GATEWAY_`-prefixed. Security features are off by default so the stack runs
+with no configuration; turn them on explicitly.
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `GATEWAY_BACKEND` | `ollama` | `ollama` or `openai` |
+| `GATEWAY_BACKEND_URL` | `http://localhost:11434` | must match the protocol — add `/v1` for `openai` |
+| `GATEWAY_BACKEND_API_KEY` | _(empty)_ | sent as a bearer token when set |
+| `GATEWAY_MAX_CONCURRENT_REQUESTS` | `4` | slot count; requests beyond this wait |
+| `GATEWAY_REQUEST_TIMEOUT` | `120.0` | seconds, applied to the backend HTTP client |
+| `GATEWAY_DEFAULT_MODEL` | `llama3.2:1b` | a request naming this model is eligible for tier routing; any other model is passed through unchanged |
+| `GATEWAY_MODEL_FAST` / `_BALANCED` / `_POWERFUL` | `llama3.2:1b` | routing tiers, all the same model until you pull more |
+| `GATEWAY_AUTH_ENABLED` | `false` | **off by default** |
+| `GATEWAY_API_KEYS` | _(empty)_ | comma-separated; `/health`, `/metrics`, `/v1/models` stay open |
+| `GATEWAY_RATE_LIMIT_ENABLED` | `false` | **off by default** |
+| `GATEWAY_MAX_REQUESTS_PER_MINUTE` | `60` | per key, fixed window |
+| `GATEWAY_MAX_TOKENS_PER_MINUTE` | `10000` | charged upfront from `max_tokens` |
+| `GATEWAY_TRACING_ENABLED` | `false` (`true` in compose) | |
+| `GATEWAY_OTLP_ENDPOINT` | `http://localhost:4317` | **tested with Jaeger only** |
 
 ---
 
@@ -228,18 +282,26 @@ and TGI support as untested.
 ```
 llm-serving-stack/
 ├── gateway/
-│   ├── main.py         FastAPI app — routes, lifespan, semaphore queue
-│   ├── backend.py      Ollama HTTP client (sync + streaming)
+│   ├── main.py         FastAPI app — routes, admission control, SSE, spans
+│   ├── backend.py      Backend protocol + Ollama and OpenAI-compatible clients
+│   ├── router.py       Prompt-complexity tier selection
+│   ├── auth.py         API key middleware
+│   ├── limiter.py      Fixed-window request and token budget
 │   ├── metrics.py      Prometheus metric definitions
+│   ├── tracing.py      OpenTelemetry setup
+│   ├── logger.py       JSON logging with trace_id injection
 │   ├── schemas.py      OpenAI-compatible Pydantic models
 │   ├── config.py       Settings via env vars
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── benchmark/
-│   └── bench.py        4-scenario benchmark
+│   ├── bench.py        5-scenario benchmark
+│   └── RESULTS.md      Measured numbers, with conditions
 ├── observability/
 │   ├── prometheus.yml
-│   └── grafana/        Auto-provisioned datasource + dashboard
+│   ├── loki/           Log store config
+│   ├── promtail/       Ships container logs to Loki
+│   └── grafana/        Auto-provisioned datasources + dashboard
 ├── docker-compose.yml
 ```
 
