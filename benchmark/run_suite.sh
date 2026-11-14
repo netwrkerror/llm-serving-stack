@@ -32,15 +32,23 @@ GATEWAY="http://localhost:8000"
 die() { echo "ABORT: $*" >&2; exit 1; }
 step() { echo; echo "=== $* ==="; }
 
-# Pick an interpreter that actually has httpx; python3 and pip often diverge.
+# Needs httpx AND >= 3.10 (bench.py uses `X | None`). python3 and pip often diverge,
+# and falling through to an old anaconda python that happens to have httpx is worse
+# than failing, so check both. The repo venv from `make test` is the best candidate.
 PY=""
-for cand in "${PYTHON:-}" python3 python; do
+for cand in "${PYTHON:-}" "$STACK_DIR/.venv/bin/python" python3 python; do
     [[ -n "$cand" ]] || continue
-    if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import httpx" >/dev/null 2>&1; then
+    command -v "$cand" >/dev/null 2>&1 || continue
+    if "$cand" -c "import sys,httpx; sys.exit(0 if sys.version_info >= (3,10) else 1)" >/dev/null 2>&1; then
         PY="$cand"; break
     fi
 done
-[[ -n "$PY" ]] || die "no interpreter with httpx. Try: python3 -m pip install httpx (or set PYTHON=/path/to/python)"
+if [[ -z "$PY" ]]; then
+    die "no Python >= 3.10 with httpx installed.
+  Easiest fix:  make test     (creates .venv with everything needed)
+  Or:           python3 -m pip install httpx
+  Or:           PYTHON=/path/to/python $0 $PARALLEL"
+fi
 
 exec > >(tee "$OUT") 2>&1
 
@@ -52,12 +60,25 @@ step "1. Clean slate (drops the Prometheus volume)"
 docker compose down -v
 
 step "2. Stop the menu-bar app and any running server"
+# Ask politely first; the app does not always honour the quit event, so fall back
+# to terminating it. It must be gone, or it respawns its own server on 11434 and
+# that server never sees OLLAMA_NUM_PARALLEL.
 osascript -e 'quit app "Ollama"' 2>/dev/null || true
-pkill ollama 2>/dev/null || true
-sleep 3
+for _ in $(seq 1 5); do
+    pgrep -f "Ollama.app" >/dev/null 2>&1 || break
+    sleep 1
+done
 if pgrep -f "Ollama.app" >/dev/null 2>&1; then
-    die "the Ollama menu-bar app is still running; it will respawn its own server and ignore OLLAMA_NUM_PARALLEL"
+    echo "  quit event ignored, terminating the app"
+    pkill -f "Ollama.app" 2>/dev/null || true
+    sleep 3
 fi
+pkill ollama 2>/dev/null || true
+sleep 2
+if pgrep -f "Ollama.app" >/dev/null 2>&1; then
+    die "the Ollama menu-bar app is still running; it will respawn its own server and ignore OLLAMA_NUM_PARALLEL. Quit it from the menu bar and re-run."
+fi
+echo "  no menu-bar app running"
 
 step "3. Launch ollama serve with OLLAMA_NUM_PARALLEL=$PARALLEL"
 OLLAMA_NUM_PARALLEL="$PARALLEL" nohup ollama serve > "$OLLAMA_LOG" 2>&1 &
