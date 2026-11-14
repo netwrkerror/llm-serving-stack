@@ -7,7 +7,7 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .auth import APIKeyMiddleware
@@ -108,13 +108,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     log.info("request_received", extra={"model": routed_model, "tier": tier, "stream": req.stream})
 
     if req.stream:
-        resp = _stream_response(req, tier)
+        resp: Response = _stream_response(req, tier)
     else:
-        resp = await _sync_response(req, tier)
+        # JSONResponse rather than the Pydantic model directly, so the headers below
+        # apply to both paths.
+        resp = JSONResponse(content=(await _sync_response(req, tier)).model_dump())
 
-    if hasattr(resp, "headers"):
-        resp.headers["X-Model-Tier"] = tier
-        resp.headers["X-Routed-Model"] = routed_model
+    resp.headers["X-Model-Tier"] = tier
+    resp.headers["X-Routed-Model"] = routed_model
     return resp
 
 
