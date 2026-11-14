@@ -113,7 +113,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     else:
         # JSONResponse rather than the Pydantic model directly, so the headers below
         # apply to both paths.
-        resp = JSONResponse(content=(await _sync_response(req, tier)).model_dump())
+        resp = JSONResponse(content=(await _sync_response(req, tier, arrival)).model_dump())
 
     resp.headers["X-Model-Tier"] = tier
     resp.headers["X-Routed-Model"] = routed_model
@@ -197,15 +197,18 @@ def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> S
                                     yield f"data: {json.dumps(chunk)}\n\n"
 
                                 if done:
+                                    # generation time drives throughput; end-to-end drives latency
                                     duration = time.perf_counter() - start
+                                    e2e = time.perf_counter() - arrival
                                     _record_backend_timings(inf_span, timings)
                                     REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
-                                    REQUEST_DURATION.labels(model=model, stream="true").observe(duration)
+                                    REQUEST_DURATION.labels(model=model, stream="true").observe(e2e)
                                     TOKENS_GENERATED.labels(model=model).inc(token_count)
                                     THROUGHPUT.labels(model=model).observe(token_count / duration if duration > 0 else 0)
                                     log.info("request_completed", extra={
                                         "model": model, "stream": True,
-                                        "duration_s": round(duration, 3),
+                                        "duration_s": round(e2e, 3),
+                                        "generation_s": round(duration, 3),
                                         "tokens": token_count,
                                         "tps": round(token_count / duration if duration > 0 else 0, 1),
                                     })
@@ -229,7 +232,7 @@ def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> S
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-async def _sync_response(req: ChatCompletionRequest, tier: str) -> ChatCompletionResponse:
+async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float) -> ChatCompletionResponse:
     model = req.model
     t = get_tracer()
     IN_FLIGHT.labels(model=model).inc()
@@ -249,15 +252,18 @@ async def _sync_response(req: ChatCompletionRequest, tier: str) -> ChatCompletio
                         log.error("request_failed", extra={"model": model, "error": str(exc)})
                         raise HTTPException(status_code=500, detail=str(exc))
 
+                    # generation time drives throughput; end-to-end drives latency
                     duration = time.perf_counter() - start
+                    e2e = time.perf_counter() - arrival
                     _record_backend_timings(inf_span, timings)
                     REQUEST_COUNT.labels(model=model, status="success", stream="false").inc()
-                    REQUEST_DURATION.labels(model=model, stream="false").observe(duration)
+                    REQUEST_DURATION.labels(model=model, stream="false").observe(e2e)
                     TOKENS_GENERATED.labels(model=model).inc(completion_tok)
                     THROUGHPUT.labels(model=model).observe(completion_tok / duration if duration > 0 else 0)
                     log.info("request_completed", extra={
                         "model": model, "stream": False,
-                        "duration_s": round(duration, 3),
+                        "duration_s": round(e2e, 3),
+                        "generation_s": round(duration, 3),
                         "tokens": completion_tok,
                         "tps": round(completion_tok / duration if duration > 0 else 0, 1),
                     })

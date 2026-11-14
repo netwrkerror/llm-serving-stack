@@ -8,9 +8,10 @@ REQUEST_COUNT = Counter(
 
 REQUEST_DURATION = Histogram(
     "llm_request_duration_seconds",
-    "End-to-end request duration",
+    "End-to-end request duration: arrival to last byte, including queue wait. "
+    "Per-phase breakdown lives on the trace spans",
     ["model", "stream"],
-    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
+    buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 10.0, 30.0, 60.0],
 )
 
 TTFT = Histogram(
