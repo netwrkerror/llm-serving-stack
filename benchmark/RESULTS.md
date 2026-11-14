@@ -7,6 +7,10 @@ not measured is not listed here.
 > posting a hand-built prompt string to `/api/generate`, which tokenized differently
 > (32 prompt tokens vs 27 for the same message). Their token counts are not comparable
 > with later runs; the latency and contention figures are unaffected.
+>
+> Earlier runs also predate the mid-stream error fix, when `bench.py` skipped error
+> chunks and counted a failed stream as a short success. Any table from a run that hit
+> upstream errors would have overstated its success rate and understated latency.
 
 ---
 

@@ -84,6 +84,11 @@ async def call(client: httpx.AsyncClient, gateway: str, model: str, stream: bool
                         chunk = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
+                    err = chunk.get("error")
+                    if err:
+                        # a mid-stream failure, not a short answer — count it as failed
+                        msg = err.get("message") if isinstance(err, dict) else err
+                        raise RuntimeError(f"stream error: {msg}")
                     usage = chunk.get("usage")
                     if usage and usage.get("completion_tokens") is not None:
                         reported_tokens = usage["completion_tokens"]

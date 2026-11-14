@@ -164,6 +164,8 @@ def _record_backend_timings(span, timings: dict) -> None:
 
 def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> StreamingResponse:
     model = req.model
+    # Absent stream_options means send usage; an explicit value wins either way.
+    include_usage = req.stream_options.include_usage if req.stream_options else True
 
     # The handler returns this StreamingResponse before the generator body runs, so the
     # queue slot has to be acquired here and held until the final chunk is yielded.
@@ -230,7 +232,7 @@ def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> S
                                     # OpenAI API uses for stream_options.include_usage. Chunk
                                     # counting is approximate; the backend's own count is not.
                                     usage = meta.get("usage", {})
-                                    if usage:
+                                    if usage and include_usage:
                                         yield "data: " + json.dumps({
                                             "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
                                             "object": "chat.completion.chunk",
@@ -245,7 +247,19 @@ def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> S
                                 time.perf_counter() - arrival
                             )
                             log.error("request_failed", extra={"model": model, "error": str(exc)})
-                            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+                            inf_span.record_exception(exc)
+                            # OpenAI's mid-stream error shape: a nested error object. The
+                            # SDK reads .message off it and raises APIError; a bare string
+                            # would surface as a generic "error occurred" instead.
+                            yield "data: " + json.dumps({
+                                "error": {
+                                    "message": str(exc),
+                                    "type": "upstream_error",
+                                    "param": None,
+                                    "code": None,
+                                }
+                            }) + "\n\n"
+                            yield "data: [DONE]\n\n"
                 finally:
                     _queue.release()
         finally:
