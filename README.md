@@ -145,6 +145,35 @@ python3 -m pip install httpx
 python3 benchmark/bench.py
 ```
 
+Measured results, with the conditions they were taken under, are in
+[`benchmark/RESULTS.md`](benchmark/RESULTS.md).
+
+#### Setting OLLAMA_NUM_PARALLEL
+
+Ollama's concurrency is set on the **server process**, not the client. On macOS the
+menu-bar app runs its own server and will respawn it without your shell's environment,
+so `OLLAMA_NUM_PARALLEL=4 ollama serve` silently has no effect while the app is running —
+and `pkill ollama` just hands control back to the app.
+
+Quit the menu-bar app first, then launch the server yourself:
+
+```bash
+osascript -e 'quit app "Ollama"'
+pkill ollama
+OLLAMA_NUM_PARALLEL=4 ollama serve > /tmp/ollama.log 2>&1 &
+```
+
+Confirm it took effect — this must show the value you set:
+
+```bash
+grep -o "OLLAMA_NUM_PARALLEL:[0-9]*" /tmp/ollama.log | tail -1
+# OLLAMA_NUM_PARALLEL:4
+```
+
+Check the log of the server you started. `~/.ollama/logs/server.log` is the menu-bar
+app's server log, so it only ever reflects that server; a server launched from the shell
+logs to stdout, wherever you redirect it.
+
 ---
 
 ## Observability
