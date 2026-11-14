@@ -77,45 +77,30 @@ class OllamaBackend:
         return [m["name"] for m in resp.json().get("models", []) if m.get("name")]
 
     def _to_ollama_payload(self, req: ChatCompletionRequest) -> dict:
-        # /api/generate applies the model's chat template to whatever string we pass, so
-        # these "User:/Assistant:" markers land as literal text inside a single templated
-        # user turn — double-wrapping. Measured on llama3.2:1b: 32 prompt tokens here vs
-        # 27 via /api/chat or /v1 for the same message. Multi-turn fares worse, since every
-        # turn collapses into one user message. Use GATEWAY_BACKEND=openai for faithful
-        # prompting; this path is kept to show the native API.
-        system_prompt = None
-        turns: list[str] = []
-        for msg in req.messages:
-            if msg.role == "system":
-                system_prompt = msg.content
-            elif msg.role == "user":
-                turns.append(f"User: {msg.content}")
-            elif msg.role == "assistant":
-                turns.append(f"Assistant: {msg.content}")
-        prompt = "\n".join(turns) + "\nAssistant:"
-
-        payload: dict = {
+        # /api/chat, not /api/generate: it takes roles directly, so the model's chat
+        # template is applied exactly once. Building a "User:/Assistant:" string for
+        # /api/generate double-wrapped it — the template was applied on top, leaving
+        # those markers as literal text inside one user turn (32 prompt tokens vs 27
+        # for the same message, and multi-turn collapsed into a single turn).
+        return {
             "model": req.model,
-            "prompt": prompt,
+            "messages": [{"role": m.role, "content": m.content} for m in req.messages],
             "options": {
                 "temperature": req.temperature,
                 "num_predict": req.max_tokens or 512,
                 "top_p": req.top_p,
             },
         }
-        if system_prompt:
-            payload["system"] = system_prompt
-        return payload
 
     async def generate(self, req: ChatCompletionRequest) -> tuple[str, int, int, dict]:
         """Non-streaming. Returns (text, prompt_tokens, completion_tokens, meta)."""
         payload = self._to_ollama_payload(req)
         payload["stream"] = False
-        resp = await self.client.post("/api/generate", json=payload)
+        resp = await self.client.post("/api/chat", json=payload)
         resp.raise_for_status()
         data = resp.json()
         return (
-            data["response"],
+            (data.get("message") or {}).get("content", ""),
             data.get("prompt_eval_count", 0),
             data.get("eval_count", 0),
             {"timings": _extract_timings(data), "usage": _extract_usage(data)},
@@ -130,23 +115,23 @@ class OllamaBackend:
         payload = self._to_ollama_payload(req)
         payload["stream"] = True
         token_count = 0
-        async with self.client.stream("POST", "/api/generate", json=payload) as resp:
+        async with self.client.stream("POST", "/api/chat", json=payload) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line.strip():
                     continue
                 try:
                     data = json.loads(line)
-                    token = data.get("response", "")
-                    done = data.get("done", False)
-                    if token:
-                        token_count += 1
-                    meta = {"timings": _extract_timings(data), "usage": _extract_usage(data)} if done else {}
-                    yield token, done, token_count, meta
-                    if done:
-                        break
                 except json.JSONDecodeError:
                     continue
+                token = (data.get("message") or {}).get("content", "")
+                done = data.get("done", False)
+                if token:
+                    token_count += 1
+                meta = {"timings": _extract_timings(data), "usage": _extract_usage(data)} if done else {}
+                yield token, done, token_count, meta
+                if done:
+                    break
 
     async def close(self) -> None:
         await self.client.aclose()

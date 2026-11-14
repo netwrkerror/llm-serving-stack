@@ -3,6 +3,11 @@
 Numbers recorded from actual runs, with the conditions they were taken under. Anything
 not measured is not listed here.
 
+> Tables below dated before the `/api/chat` switch were taken with the native backend
+> posting a hand-built prompt string to `/api/generate`, which tokenized differently
+> (32 prompt tokens vs 27 for the same message). Their token counts are not comparable
+> with later runs; the latency and contention figures are unaffected.
+
 ---
 
 ## Does OLLAMA_NUM_PARALLEL change anything?

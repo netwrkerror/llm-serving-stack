@@ -197,9 +197,9 @@ Open **http://localhost:3000** → Dashboards → **LLM Serving Stack**.
 
 | | `ollama` (default) | `openai` |
 |---|---|---|
-| Endpoint | `/api/generate` | `/v1/chat/completions` |
+| Endpoint | `/api/chat` | `/v1/chat/completions` |
 | URL form | `http://host:11434` | `http://host:11434/v1` |
-| Sends | a single prompt string | the `messages` list |
+| Sends | the `messages` list | the `messages` list |
 | Backend timings on spans | yes | no |
 
 ```yaml
@@ -211,13 +211,11 @@ GATEWAY_BACKEND_API_KEY: ""   # if the backend requires one
 
 Everything else — the gateway API, metrics, dashboard, traces — stays identical.
 
-**Prefer `openai` if prompt fidelity matters.** The `ollama` backend builds a
-`"User:/Assistant:"` string and posts it to `/api/generate`, which then applies the
-model's chat template *on top*, so those markers become literal text inside a single
-user turn. On `llama3.2:1b` that is 32 prompt tokens versus 27 via `/v1` for the same
-message, and multi-turn conversations collapse into one turn. The native path is kept
-because it exercises Ollama's own API and reports per-phase timings the OpenAI
-protocol has no field for.
+Both send roles to an endpoint that applies the model's chat template once, so prompts
+tokenize identically — 27 prompt tokens for the same message on `llama3.2:1b` either way.
+The native path is worth keeping because it reports per-phase timings (`ollama.load_ms`,
+`prompt_eval_ms`, `eval_ms`) that the OpenAI protocol has no field for; those show up as
+span attributes in Jaeger.
 
 **Tested against Ollama's `/v1` only.** vLLM and TGI both speak this protocol, but
 neither has been run here — that is Part 3, on a rented GPU. Until then, treat vLLM
