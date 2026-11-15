@@ -162,6 +162,11 @@ echo "  ok"
 
 step "7. Bring the stack up"
 docker compose up -d --build
+# Counters like llm_tokens_generated_total live in the gateway process, so clearing
+# Prometheus series does not reset them. Without this restart, "Total Tokens
+# Generated" shows every run since the container started, not this one.
+docker compose restart gateway >/dev/null
+echo "  gateway restarted so in-process counters start from zero"
 echo "  waiting for the gateway..."
 for i in $(seq 1 30); do
     if curl -fsS --max-time 3 "$GATEWAY/health" >/dev/null 2>&1; then break; fi
