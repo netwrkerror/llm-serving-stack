@@ -44,18 +44,6 @@ request issued *after* a non-streaming one in the same process fails with
 same stream succeeds as the first request in a fresh process. Stage 2's backend registry
 built in `lifespan` should make this go away; if it doesn't, tests need one client per loop.
 
-**Found one more copy of the retracted claim.** `CODE_WALKTHROUGH.md` said "This models
-vLLM's request scheduler" about the same semaphore — the exact claim Part 1 retracted.
-Corrected it rather than leave it standing. Two caveats: it is beyond the five items
-Stage 0 listed, and `.gitignore` excludes `CODE*.md`, so that file is a local-only doc
-and the fix is **not** part of the PR. Nothing public was carrying this copy.
-
-**Doc drift not fixed (needs its own pass):** the same walkthrough section still describes
-`ACTIVE_REQUESTS.inc()` and `async with _queue`, but the code now uses `IN_FLIGHT` and
-`_acquire_slot()` (which exists so queue-wait time is counted separately). The
-non-streaming lifecycle diagram is also pre-tracing. Left alone deliberately — it is a
-doc-sync job, not a Part 1 correction, and it would have buried this PR's five real fixes.
-
 **`.gitignore` change, worth a look in review.** The root `NOTES.md` is ignored on
 purpose (`NOTES.md`, no slash — so it matches at every level, including this file). The
 hand-back asks for notes under `benchmark/`, and the write-up is built from `RESULTS.md`
@@ -64,3 +52,66 @@ annotates. Added a `!benchmark/NOTES.md` negation rather than loosening the root
 the root file stays private. `benchmark/out/` stays ignored, so "runs are never
 destroyed" means on disk, not in git; run directories are referenced by name here and in
 `RESULTS.md` but their contents are local.
+
+## Pre-Stage 1 — the explicit-model invariant, and the heuristic's first tests (2026-11-15)
+
+Still no measurements. This closes the gap Stage 0 only commented on, before any tier can
+point at a paid backend.
+
+**Supersedes the "Unsure / flagged" note above.** That note said the gap would wait for
+Stage 3 and suggested shipping Stage 2 with `powerful` left local. The gap is now fixed
+outright instead, which is the better order: Stage 2 can point a tier at Bedrock without
+a client's named model being able to drift onto it.
+
+**The invariant.** A request that names a model goes to that model and is never
+re-routed; only `model` absent or `"auto"` goes through `classify()`. `model` is now
+optional in `schemas.py` with `"auto"` as the sentinel, so absent and `"auto"` collapse
+to one path and nothing downstream sees `None`.
+
+**What changed in behaviour, and it is worth being clear about it.** Before, `X-Model-Tier`
+reported what the heuristic *thought* even when the client's own model was used — Stage 0
+preserved that deliberately. It cannot survive this invariant, because the tier now picks
+the **backend**, not just the model. A tier is only meaningful if it says where the
+request actually went. So for a named model the tier is now the tier *serving that model*,
+found by reverse lookup over `settings.tier_models`. Verified against a real uvicorn
+server: naming `llama3.2:1b` on a prompt `auto` would have sent to `powerful` now reports
+`tier: fast` and stays there.
+
+**Two edges that needed a decision, not a default:**
+
+- *A named model matching no configured tier* (`mistral:7b`) is still honoured — the
+  backend decides whether it exists — but it has no tier, so `Route.tier` is `None` and
+  the header reads `none`. Confirmed end-to-end: the gateway passes it through and Ollama
+  returns a clean 404 with `X-Model-Tier: none`. The alternative, inventing a tier for it,
+  would have meant guessing a backend for a model nobody configured.
+- *Several tiers on the same model* is the shipped default (all three are `llama3.2:1b`),
+  so the reverse lookup needs a tie-break. It takes the first match in
+  `fast → balanced → powerful` order, i.e. the cheapest tier wins. Documented in
+  `Settings.tier_models` because the dict's insertion order is now load-bearing.
+
+**`default_model` is now only a fallback,** as asked: the three per-tier models default to
+empty and resolve to `default_model` when unset. Shipped behaviour is unchanged (all
+tiers → `llama3.2:1b`), but the fallback is real rather than three copies of the same
+literal. `schemas.py` no longer hardcodes `llama3.2:1b` either.
+
+**The heuristic had zero tests; now it has 62.** Pinning it first turned up two sharp
+edges that are pinned as-is rather than fixed, because Stage 4 is where they get judged:
+
+- *Keyword matching is plain substring containment.* "build me an analyzer" classifies as
+  `powerful` because "analyzer" contains "analyze"; so does "the designer left". For a
+  mixed workload this will over-route to the expensive tier, which is exactly the number
+  Stage 4 step 3 is supposed to produce.
+- *Only `user` messages are classified.* A keyword-heavy `system` prompt has no effect on
+  the tier. Defensible, but it means a long system prompt costs tokens the router never
+  sees — relevant once a tier is billed per token.
+
+Boundaries pinned exactly where the constants say: 20 words is still `fast`, 21 is
+`balanced`, 119 is `balanced`, 120 is `powerful`. An empty prompt is `fast`.
+
+**Correction to the Stage 0 TestClient note.** I wrote that a streaming request after a
+non-streaming one fails with `Event loop is closed`, and guessed Stage 2's registry would
+fix it. The first half is right but my framing was too narrow — *any* request after the
+first in one `TestClient` process can hit it, sync or streaming, and it is intermittent.
+It is purely a test-harness artifact: the same four-request sequence against a real
+uvicorn server returns 200/200/200/404 with correct headers throughout. Live checks in
+this repo should go through a real server, not `TestClient`.

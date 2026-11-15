@@ -8,6 +8,10 @@ _GUARDED = (
     "rate_limit_enabled",
     "max_requests_per_minute",
     "max_tokens_per_minute",
+    "default_model",
+    "model_fast",
+    "model_balanced",
+    "model_powerful",
 )
 
 

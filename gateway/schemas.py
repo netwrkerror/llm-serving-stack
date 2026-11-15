@@ -15,7 +15,9 @@ class StreamOptions(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "llama3.2:1b"
+    # Optional. Absent, or the sentinel "auto", asks the gateway to route by prompt
+    # content. Any other value names a model and is honoured as-is — never re-routed.
+    model: str = "auto"
     messages: List[ChatMessage]
     stream: bool = False
     temperature: float = 0.7

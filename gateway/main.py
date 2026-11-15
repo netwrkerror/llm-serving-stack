@@ -110,10 +110,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if not allowed:
         raise HTTPException(status_code=429, detail=reason)
 
-    tier, routed_model = resolve_route(req)
+    route = resolve_route(req)
+    routed_model = route.model
+    # A named model that matches no tier has no tier; the header still has to say
+    # something, and "none" is the honest answer.
+    tier = route.tier or "none"
     req = req.model_copy(update={"model": routed_model})
 
-    log.info("request_received", extra={"model": routed_model, "tier": tier, "stream": req.stream})
+    log.info("request_received", extra={
+        "model": routed_model,
+        "tier": tier,
+        "explicit_model": route.explicit,
+        "stream": req.stream,
+    })
 
     if req.stream:
         resp: Response = await _stream_response(req, tier, arrival)

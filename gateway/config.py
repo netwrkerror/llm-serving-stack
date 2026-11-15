@@ -11,14 +11,15 @@ class Settings(BaseSettings):
     backend_url: str = "http://localhost:11434"
     backend_api_key: str = ""
 
+    # Fallback only: the model used for a tier that has not been configured.
     default_model: str = "llama3.2:1b"
     max_concurrent_requests: int = 4
     request_timeout: float = 120.0
 
-    # Model tiers for automatic routing
-    model_fast: str = "llama3.2:1b"
-    model_balanced: str = "llama3.2:1b"
-    model_powerful: str = "llama3.2:1b"
+    # Model tiers for automatic routing. Empty means "fall back to default_model".
+    model_fast: str = ""
+    model_balanced: str = ""
+    model_powerful: str = ""
 
     # Auth — disabled by default for local dev
     # Set GATEWAY_API_KEYS="key1,key2" to enable
@@ -43,6 +44,20 @@ class Settings(BaseSettings):
     @property
     def api_key_set(self) -> set[str]:
         return {k.strip() for k in self.api_keys.split(",") if k.strip()}
+
+    @property
+    def tier_models(self) -> dict[str, str]:
+        """Each tier's model, falling back to default_model where unconfigured.
+
+        Insertion order is the tie-break for the reverse lookup in router.py: with
+        several tiers on the same model, the cheapest one wins. Read fresh each call so
+        tests and env changes are not frozen at import.
+        """
+        return {
+            "fast": self.model_fast or self.default_model,
+            "balanced": self.model_balanced or self.default_model,
+            "powerful": self.model_powerful or self.default_model,
+        }
 
 
 settings = Settings()
