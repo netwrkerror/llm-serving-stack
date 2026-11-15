@@ -21,7 +21,10 @@
       },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "sum(rate(llm_requests_total[1m])) by (status)",
           "legendFormat": "{{status}}"
         }
@@ -34,7 +37,11 @@
           }
         }
       },
-      "interval": "5s"
+      "interval": "5s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
     },
     {
       "id": 2,
@@ -49,17 +56,26 @@
       },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "sum(llm_active_requests) by (model)",
           "legendFormat": "in-flight {{model}}"
         },
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "sum(llm_queue_waiting_requests) by (model)",
           "legendFormat": "waiting {{model}}"
         },
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "sum(llm_active_requests) by (model) - sum(llm_queue_waiting_requests) by (model)",
           "legendFormat": "running {{model}}"
         }
@@ -72,7 +88,11 @@
           }
         }
       },
-      "interval": "5s"
+      "interval": "5s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
     },
     {
       "id": 3,
@@ -87,12 +107,18 @@
       },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "label_replace(label_replace(\n          histogram_quantile(0.50, sum(rate(llm_request_duration_seconds_bucket[1m])) by (le, stream, status)),\n          \"mode\", \"stream\", \"stream\", \"true\"),\n          \"mode\", \"sync\", \"stream\", \"false\")",
           "legendFormat": "p50 ({{mode}}) \u00b7 {{status}}"
         },
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "label_replace(label_replace(\n          histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[1m])) by (le, stream, status)),\n          \"mode\", \"stream\", \"stream\", \"true\"),\n          \"mode\", \"sync\", \"stream\", \"false\")",
           "legendFormat": "p95 ({{mode}}) \u00b7 {{status}}"
         }
@@ -105,7 +131,11 @@
           }
         }
       },
-      "interval": "5s"
+      "interval": "5s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
     },
     {
       "id": 4,
@@ -119,12 +149,18 @@
       },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "histogram_quantile(0.50, sum(rate(llm_time_to_first_token_seconds_bucket[1m])) by (le, model))",
           "legendFormat": "TTFT p50 {{model}}"
         },
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "histogram_quantile(0.95, sum(rate(llm_time_to_first_token_seconds_bucket[1m])) by (le, model))",
           "legendFormat": "TTFT p95 {{model}}"
         }
@@ -137,7 +173,11 @@
           }
         }
       },
-      "interval": "5s"
+      "interval": "5s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
     },
     {
       "id": 5,
@@ -151,7 +191,10 @@
       },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "histogram_quantile(0.50, sum(rate(llm_tokens_per_second_bucket[1m])) by (le, model))",
           "legendFormat": "per-request p50 {{model}}"
         }
@@ -165,7 +208,11 @@
         }
       },
       "interval": "5s",
-      "description": "Each request's own tokens divided by its own inference call, so any time it spent waiting inside the backend counts against its rate. One observation per request \u2014 this is NOT system throughput. For that, use the aggregate figure bench.py reports (all tokens over wall clock), which is roughly this times the number of requests generating concurrently."
+      "description": "Each request's own tokens divided by its own inference call, so any time it spent waiting inside the backend counts against its rate. One observation per request \u2014 this is NOT system throughput. For that, use the aggregate figure bench.py reports (all tokens over wall clock), which is roughly this times the number of requests generating concurrently.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
     },
     {
       "id": 6,
@@ -179,7 +226,10 @@
       },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "sum(llm_tokens_generated_total) by (model)",
           "legendFormat": "{{model}}"
         }
@@ -188,7 +238,31 @@
         "defaults": {
           "unit": "short"
         }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
       }
     }
-  ]
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1,
+        "hide": 0,
+        "current": {
+          "text": "Prometheus",
+          "value": "prometheus-main",
+          "selected": false
+        },
+        "options": [],
+        "regex": "",
+        "description": "Switch to an archived run's Prometheus to view it in these panels"
+      }
+    ]
+  }
 }

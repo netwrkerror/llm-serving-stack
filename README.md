@@ -198,10 +198,13 @@ is snapshotted out first, so nothing is lost.
 
 #### Reading an earlier run
 
-Start a second Prometheus on the archived snapshot and point Grafana at it:
+The dashboard has a **Data source** variable at the top. It defaults to the live
+Prometheus, and pointing it at an archived run needs no edits to any panel.
+
+Serve the snapshot on a spare port:
 
 ```bash
-cp -R benchmark/out/run-1-20261115-000343/prometheus-snapshot /tmp/old-run
+cp -R benchmark/out/run-1-20261115-100640/prometheus-snapshot /tmp/old-run
 docker run --rm -d --name prom-old -p 9091:9090 \
   -v /tmp/old-run:/prometheus \
   -v "$PWD/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
@@ -211,10 +214,17 @@ docker run --rm -d --name prom-old -p 9091:9090 \
 
 Copy first — Prometheus writes a lock file, so it will not open a read-only mount.
 
-Then in Grafana, add a Prometheus data source at `http://host.docker.internal:9091`
-and switch the dashboard's data source to it. The dashboard works unchanged, since
-every panel queries by metric name. Set the time range to when the run happened —
-the transcript's filename is its timestamp. `docker rm -f prom-old` when finished.
+In Grafana, add a Prometheus data source pointing at
+`http://host.docker.internal:9091`, then open the dashboard and pick it from the
+**Data source** dropdown. Every panel repopulates. Set an **absolute** time range
+covering the run — the run directory's name is its start timestamp, and the
+transcript records how long it took. Two runs compared side by side should use
+windows of equal length.
+
+To compare two archived runs, serve both on different ports, add both as data
+sources, and switch the variable between them without touching the time range.
+
+`docker rm -f prom-old` when finished.
 
 #### Setting OLLAMA_NUM_PARALLEL
 
