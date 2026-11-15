@@ -26,7 +26,7 @@ from .metrics import (
     TOKENS_GENERATED,
     TTFT,
 )
-from .router import classify, select_model
+from .router import resolve_route
 from .tracing import get_tracer, setup_tracing
 from .schemas import (
     ChatCompletionChoice,
@@ -110,11 +110,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if not allowed:
         raise HTTPException(status_code=429, detail=reason)
 
-    routed_model = select_model(req)
-    tier = classify(req)
+    route = resolve_route(req)
+    routed_model = route.model
+    # A named model that matches no tier has no tier; the header still has to say
+    # something, and "none" is the honest answer.
+    tier = route.tier or "none"
     req = req.model_copy(update={"model": routed_model})
 
-    log.info("request_received", extra={"model": routed_model, "tier": tier, "stream": req.stream})
+    log.info("request_received", extra={
+        "model": routed_model,
+        "tier": tier,
+        "explicit_model": route.explicit,
+        "stream": req.stream,
+    })
 
     if req.stream:
         resp: Response = await _stream_response(req, tier, arrival)
@@ -152,11 +160,14 @@ def _record_backend_timings(span, timings: dict) -> None:
 
     Only Ollama reports these; OpenAI-compatible backends send nothing, so skip quietly.
 
-    unattributed_ms is total minus the phases Ollama attributes to this request. Measured
-    against OLLAMA_NUM_PARALLEL=1 vs 4, this is the term that tracks backend contention:
-    it goes from ~1ms on the first request to ~400ms on the last of four concurrent ones,
-    while each request's own eval time stays flat. Note total_duration already includes
-    that wait, so wall-clock-minus-total measures only HTTP overhead, not queueing.
+    unattributed_ms is total minus the phases Ollama attributes to this request. It is the
+    term that tracks backend contention: it grows when requests wait on each other inside
+    Ollama, while each request's own eval time stays flat. Note total_duration already
+    includes that wait, so wall-clock-minus-total measures only HTTP overhead, not queueing.
+
+    For the measured values, and the scenario and run directory behind each, see the
+    OLLAMA_NUM_PARALLEL sweeps in benchmark/RESULTS.md. Figures are not repeated here so
+    there is one place to keep them honest.
     """
     if not timings:
         return

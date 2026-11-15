@@ -2,7 +2,7 @@
 
 A production-grade LLM inference stack built layer by layer — OpenAI-compatible gateway, Prometheus observability, Grafana dashboards, and benchmarking.
 
-Backed locally by [Ollama](https://ollama.com) (Metal-accelerated on Apple Silicon). Swappable with vLLM or TGI in production by changing one env var.
+Backed locally by [Ollama](https://ollama.com) (Metal-accelerated on Apple Silicon). Speaks the OpenAI protocol too, so vLLM or TGI can sit behind it; only tested against Ollama's own /v1 so far.
 
 ---
 
@@ -16,7 +16,7 @@ Client (curl / Python / OpenAI SDK)
 │     FastAPI Gateway        │  :8000
 │  ─────────────────────     │
 │  • OpenAI-compatible API   │
-│  • Async request queue     │  ← models vLLM's continuous batching scheduler
+│  • Async request queue     │  ← admission control: caps in-flight requests; batching is the backend's
 │  • SSE streaming           │  ← same wire format as vLLM / TGI
 │  • Prometheus metrics      │  ← TTFT, latency p95, TPS, queue depth
 └────────────┬───────────────┘
@@ -66,7 +66,7 @@ VRAM, which is what makes aggressive batching practical.
 | `gateway/` | FastAPI app — admission control, sync + streaming inference, routing, auth, rate limiting |
 | `observability/` | Prometheus + Grafana, Jaeger traces, Loki/Promtail logs |
 | `benchmark/` | 5-scenario load test, ending oversubscribed so gateway queueing shows up |
-| Routing | Model tier chosen from prompt complexity; `X-Model-Tier` on the response |
+| Routing | `model` absent or `"auto"` picks a tier from prompt complexity; naming a model is honoured as-is. `X-Model-Tier` / `X-Routed-Model` on the response |
 | Auth | API key middleware — **off by default**, set `GATEWAY_AUTH_ENABLED` and `GATEWAY_API_KEYS` |
 | Rate limiting | Per-key requests/min and token budget — **off by default**, set `GATEWAY_RATE_LIMIT_ENABLED` |
 | Tracing | OpenTelemetry spans — **tested with Jaeger only**; any OTLP collector should work, untested |
@@ -129,6 +129,15 @@ curl -N http://localhost:8000/v1/chat/completions \
     "messages": [{"role": "user", "content": "Explain vLLM in 3 sentences."}],
     "stream": true
   }'
+
+# Let the gateway choose the tier: omit "model", or send "auto".
+# Naming a model instead — as the two calls above do — is always honoured as-is.
+curl -i http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "auto",
+    "messages": [{"role": "user", "content": "Compare paged and contiguous KV cache."}]
+  }' | grep -i "x-model-tier\|x-routed-model"
 ```
 
 ### OpenAI Python SDK
@@ -302,8 +311,8 @@ with no configuration; turn them on explicitly.
 | `GATEWAY_BACKEND_API_KEY` | _(empty)_ | sent as a bearer token when set |
 | `GATEWAY_MAX_CONCURRENT_REQUESTS` | `4` | slot count; requests beyond this wait |
 | `GATEWAY_REQUEST_TIMEOUT` | `120.0` | seconds, applied to the backend HTTP client |
-| `GATEWAY_DEFAULT_MODEL` | `llama3.2:1b` | a request naming this model is eligible for tier routing; any other model is passed through unchanged |
-| `GATEWAY_MODEL_FAST` / `_BALANCED` / `_POWERFUL` | `llama3.2:1b` | routing tiers, all the same model until you pull more |
+| `GATEWAY_DEFAULT_MODEL` | `llama3.2:1b` | fallback only — the model used for a tier that has not been configured |
+| `GATEWAY_MODEL_FAST` / `_BALANCED` / `_POWERFUL` | _(empty → `GATEWAY_DEFAULT_MODEL`)_ | routing tiers, all the same model until you pull more |
 | `GATEWAY_AUTH_ENABLED` | `false` | **off by default** |
 | `GATEWAY_API_KEYS` | _(empty)_ | comma-separated; `/health`, `/metrics`, `/v1/models` stay open |
 | `GATEWAY_RATE_LIMIT_ENABLED` | `false` | **off by default** |

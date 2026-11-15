@@ -38,3 +38,6 @@ benchmark/out/
 CODE*.md
 NOTES.md
 blog/
+
+# The working notes behind the measurements are tracked; the root NOTES.md stays local.
+!benchmark/NOTES.md
