@@ -32,6 +32,9 @@ grafana_data/
 
 # Benchmark output
 *.json.bak
+benchmark/out/
 
 # Docs
 CODE*.md
+NOTES.md
+blog/

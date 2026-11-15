@@ -8,16 +8,18 @@ REQUEST_COUNT = Counter(
 
 REQUEST_DURATION = Histogram(
     "llm_request_duration_seconds",
-    "End-to-end request duration",
-    ["model", "stream"],
-    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
+    "End-to-end request duration: arrival to last byte, including queue wait. "
+    "Failures are recorded too — filter on status so a burst of fast errors "
+    "doesn't drag the success quantiles down. Per-phase breakdown is on the trace spans",
+    ["model", "stream", "status"],
+    buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 10.0, 30.0, 60.0],
 )
 
 TTFT = Histogram(
     "llm_time_to_first_token_seconds",
-    "Time to first token (streaming only)",
+    "Time from request arrival to the first streamed token, including queue wait",
     ["model"],
-    buckets=[0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0],
+    buckets=[0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0],
 )
 
 TOKENS_GENERATED = Counter(
@@ -26,9 +28,17 @@ TOKENS_GENERATED = Counter(
     ["model"],
 )
 
-ACTIVE_REQUESTS = Gauge(
+IN_FLIGHT = Gauge(
     "llm_active_requests",
-    "Currently in-flight requests",
+    "Requests accepted and not yet fully returned, streaming counted until the last chunk. "
+    "Includes those still waiting for a slot: in-flight = waiting + running",
+    ["model"],
+)
+
+QUEUE_WAITING = Gauge(
+    "llm_queue_waiting_requests",
+    "Requests blocked waiting to acquire a queue slot. "
+    "Subtract from llm_active_requests to get the number actually generating",
     ["model"],
 )
 

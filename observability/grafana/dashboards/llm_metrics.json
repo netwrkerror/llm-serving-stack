@@ -24,14 +24,25 @@
     },
     {
       "id": 2,
-      "title": "Active Requests (queue depth)",
+      "title": "In-flight = waiting + running",
+      "description": "in-flight counts every accepted request, including those still queued for a slot. running is the derived difference — the ones actually generating.",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "targets": [
         {
           "datasource": "Prometheus",
           "expr": "sum(llm_active_requests) by (model)",
-          "legendFormat": "{{model}}"
+          "legendFormat": "in-flight {{model}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(llm_queue_waiting_requests) by (model)",
+          "legendFormat": "waiting {{model}}"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(llm_active_requests) by (model) - sum(llm_queue_waiting_requests) by (model)",
+          "legendFormat": "running {{model}}"
         }
       ],
       "fieldConfig": {
@@ -40,19 +51,20 @@
     },
     {
       "id": 3,
-      "title": "Request Latency (p50 / p95)",
+      "title": "Request Latency p50 / p95 — all statuses",
+      "description": "End-to-end, from request arrival. Includes failed requests; the status label separates them so a burst of fast errors doesn't drag the success quantiles down.",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "targets": [
         {
           "datasource": "Prometheus",
-          "expr": "histogram_quantile(0.50, sum(rate(llm_request_duration_seconds_bucket[1m])) by (le, stream))",
-          "legendFormat": "p50 {{stream}}"
+          "expr": "histogram_quantile(0.50, sum(rate(llm_request_duration_seconds_bucket[1m])) by (le, stream, status))",
+          "legendFormat": "p50 {{stream}} {{status}}"
         },
         {
           "datasource": "Prometheus",
-          "expr": "histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[1m])) by (le, stream))",
-          "legendFormat": "p95 {{stream}}"
+          "expr": "histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[1m])) by (le, stream, status))",
+          "legendFormat": "p95 {{stream}} {{status}}"
         }
       ],
       "fieldConfig": {

@@ -6,7 +6,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      GATEWAY_OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+      # ollama = native /api; openai = /v1/chat/completions (vLLM, TGI, Ollama's own /v1).
+      # The URL must match: .../11434 for ollama, .../11434/v1 for openai.
+      GATEWAY_BACKEND: "ollama"
+      GATEWAY_BACKEND_URL: "http://host.docker.internal:11434"
       GATEWAY_DEFAULT_MODEL: "llama3.2:1b"
       GATEWAY_MAX_CONCURRENT_REQUESTS: "4"
       GATEWAY_TRACING_ENABLED: "true"
@@ -16,6 +19,29 @@ services:
     restart: unless-stopped
     depends_on:
       - jaeger
+
+  loki:
+    image: grafana/loki:3.2.0
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/loki.yml:/etc/loki/loki.yml:ro
+    command: -config.file=/etc/loki/loki.yml
+    networks:
+      - stack
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.2.0
+    volumes:
+      - ./observability/promtail/promtail.yml:/etc/promtail/promtail.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/promtail.yml
+    networks:
+      - stack
+    restart: unless-stopped
+    depends_on:
+      - loki
 
   jaeger:
     image: jaegertracing/all-in-one:latest

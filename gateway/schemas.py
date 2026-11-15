@@ -10,6 +10,10 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = "llama3.2:1b"
     messages: List[ChatMessage]
@@ -17,6 +21,10 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = 0.7
     max_tokens: Optional[int] = 512
     top_p: float = 1.0
+    # Omitted entirely means "send usage anyway" — the gateway's default, since the
+    # backend reports exact counts and chunk-counting is approximate. Send it
+    # explicitly to get OpenAI's behaviour either way.
+    stream_options: Optional[StreamOptions] = None
 
 
 class ChatCompletionChoice(BaseModel):
