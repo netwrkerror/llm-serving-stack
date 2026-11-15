@@ -43,13 +43,36 @@ services:
     depends_on:
       - loki
 
+  # Docker creates a named volume root-owned, but Jaeger runs as uid 10001, so badger
+  # cannot create its directories. This one-shot fixes ownership and exits.
+  jaeger-init:
+    image: busybox:1.36
+    command: sh -c "mkdir -p /badger/key /badger/data && chown -R 10001:0 /badger && chmod -R 775 /badger"
+    volumes:
+      - jaeger_data:/badger
+    networks:
+      - stack
+    restart: "no"
+
   jaeger:
     image: jaegertracing/all-in-one:latest
+    depends_on:
+      jaeger-init:
+        condition: service_completed_successfully
     ports:
       - "16686:16686"   # Jaeger UI
       - "4317:4317"     # OTLP gRPC receiver
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+      # all-in-one defaults to in-memory storage, which loses every trace when the
+      # container is replaced. Badger persists to the volume below, so a benchmark
+      # run's traces survive the next run.
+      SPAN_STORAGE_TYPE: badger
+      BADGER_EPHEMERAL: "false"
+      BADGER_DIRECTORY_VALUE: /badger/data
+      BADGER_DIRECTORY_KEY: /badger/key
+    volumes:
+      - jaeger_data:/badger
     networks:
       - stack
     restart: unless-stopped
@@ -61,6 +84,14 @@ services:
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
+    # admin API enables the snapshot and delete_series endpoints, so a run's data can
+    # be exported and the series cleared without destroying the volume.
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+      - --web.enable-admin-api
     networks:
       - stack
     restart: unless-stopped
@@ -88,3 +119,4 @@ networks:
 volumes:
   prometheus_data:
   grafana_data:
+  jaeger_data:

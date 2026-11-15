@@ -176,6 +176,56 @@ aborts if `OLLAMA_NUM_PARALLEL` did not reach the server:
 Measured results, with the conditions they were taken under, are in
 [`benchmark/RESULTS.md`](benchmark/RESULTS.md).
 
+#### What a run leaves behind
+
+Runs do not destroy each other. Each writes a directory:
+
+```
+benchmark/out/run-<n>-<timestamp>/
+    transcript.txt              everything the script printed
+    prometheus-snapshot/        that run's TSDB, exported at the end
+    traces-oversubscribed.txt   trace IDs for the c=8 scenario, with queue wait
+                                and the ollama.* timings, so they can be found later
+```
+
+Jaeger keeps every run's spans — it is configured with badger on a named volume
+rather than the all-in-one default of in-memory storage, which loses everything when
+the container is replaced. Look a trace up by ID from `traces-oversubscribed.txt`.
+
+Prometheus is a single instance, so `llm_*` series are cleared at the start of each
+run to keep the live dashboard showing only the current one. The previous run's data
+is snapshotted out first, so nothing is lost.
+
+#### Reading an earlier run
+
+The dashboard has a **Data source** variable at the top. It defaults to the live
+Prometheus, and pointing it at an archived run needs no edits to any panel.
+
+Serve the snapshot on a spare port:
+
+```bash
+cp -R benchmark/out/run-1-20261115-100640/prometheus-snapshot /tmp/old-run
+docker run --rm -d --name prom-old -p 9091:9090 \
+  -v /tmp/old-run:/prometheus \
+  -v "$PWD/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+  prom/prometheus:v2.55.0 \
+  --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus
+```
+
+Copy first — Prometheus writes a lock file, so it will not open a read-only mount.
+
+In Grafana, add a Prometheus data source pointing at
+`http://host.docker.internal:9091`, then open the dashboard and pick it from the
+**Data source** dropdown. Every panel repopulates. Set an **absolute** time range
+covering the run — the run directory's name is its start timestamp, and the
+transcript records how long it took. Two runs compared side by side should use
+windows of equal length.
+
+To compare two archived runs, serve both on different ports, add both as data
+sources, and switch the variable between them without touching the time range.
+
+`docker rm -f prom-old` when finished.
+
 #### Setting OLLAMA_NUM_PARALLEL
 
 Ollama's concurrency is set on the **server process**, not the client. On macOS the

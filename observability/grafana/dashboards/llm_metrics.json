@@ -4,125 +4,265 @@
   "schemaVersion": 38,
   "version": 1,
   "refresh": "5s",
-  "time": { "from": "now-5m", "to": "now" },
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
   "panels": [
     {
       "id": 1,
       "title": "Request Rate (req/s)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "sum(rate(llm_requests_total[1m])) by (status)",
           "legendFormat": "{{status}}"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "reqps", "custom": { "lineWidth": 2 } }
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "interval": "5s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
       }
     },
     {
       "id": 2,
       "title": "In-flight = waiting + running",
-      "description": "in-flight counts every accepted request, including those still queued for a slot. running is the derived difference — the ones actually generating.",
+      "description": "in-flight counts every accepted request, including those still queued for a slot. running is the derived difference \u2014 the ones actually generating.",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "sum(llm_active_requests) by (model)",
           "legendFormat": "in-flight {{model}}"
         },
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "sum(llm_queue_waiting_requests) by (model)",
           "legendFormat": "waiting {{model}}"
         },
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "sum(llm_active_requests) by (model) - sum(llm_queue_waiting_requests) by (model)",
           "legendFormat": "running {{model}}"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "custom": { "lineWidth": 2 } }
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "interval": "5s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
       }
     },
     {
       "id": 3,
-      "title": "Request Latency p50 / p95 — all statuses",
+      "title": "Request Latency p50 / p95 \u2014 all statuses",
       "description": "End-to-end, from request arrival. Includes failed requests; the status label separates them so a burst of fast errors doesn't drag the success quantiles down.",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
       "targets": [
         {
-          "datasource": "Prometheus",
-          "expr": "histogram_quantile(0.50, sum(rate(llm_request_duration_seconds_bucket[1m])) by (le, stream, status))",
-          "legendFormat": "p50 {{stream}} {{status}}"
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(label_replace(\n          histogram_quantile(0.50, sum(rate(llm_request_duration_seconds_bucket[1m])) by (le, stream, status)),\n          \"mode\", \"stream\", \"stream\", \"true\"),\n          \"mode\", \"sync\", \"stream\", \"false\")",
+          "legendFormat": "p50 ({{mode}}) \u00b7 {{status}}"
         },
         {
-          "datasource": "Prometheus",
-          "expr": "histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[1m])) by (le, stream, status))",
-          "legendFormat": "p95 {{stream}} {{status}}"
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "label_replace(label_replace(\n          histogram_quantile(0.95, sum(rate(llm_request_duration_seconds_bucket[1m])) by (le, stream, status)),\n          \"mode\", \"stream\", \"stream\", \"true\"),\n          \"mode\", \"sync\", \"stream\", \"false\")",
+          "legendFormat": "p95 ({{mode}}) \u00b7 {{status}}"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "s", "custom": { "lineWidth": 2 } }
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "interval": "5s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
       }
     },
     {
       "id": 4,
-      "title": "Time to First Token — TTFT (streaming)",
+      "title": "Time to First Token \u2014 TTFT (streaming)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "histogram_quantile(0.50, sum(rate(llm_time_to_first_token_seconds_bucket[1m])) by (le, model))",
           "legendFormat": "TTFT p50 {{model}}"
         },
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "histogram_quantile(0.95, sum(rate(llm_time_to_first_token_seconds_bucket[1m])) by (le, model))",
           "legendFormat": "TTFT p95 {{model}}"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "s", "custom": { "lineWidth": 2 } }
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "interval": "5s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
       }
     },
     {
       "id": 5,
-      "title": "Tokens per Second (throughput)",
+      "title": "Per-request tokens/sec (p50)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "histogram_quantile(0.50, sum(rate(llm_tokens_per_second_bucket[1m])) by (le, model))",
-          "legendFormat": "TPS p50 {{model}}"
+          "legendFormat": "per-request p50 {{model}}"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "custom": { "lineWidth": 2 } }
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      },
+      "interval": "5s",
+      "description": "Each request's own tokens divided by its own inference call, so any time it spent waiting inside the backend counts against its rate. One observation per request \u2014 this is NOT system throughput. For that, use the aggregate figure bench.py reports (all tokens over wall clock), which is roughly this times the number of requests generating concurrently.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
       }
     },
     {
       "id": 6,
       "title": "Total Tokens Generated",
       "type": "stat",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
       "targets": [
         {
-          "datasource": "Prometheus",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
           "expr": "sum(llm_tokens_generated_total) by (model)",
           "legendFormat": "{{model}}"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short" }
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
       }
     }
-  ]
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1,
+        "hide": 0,
+        "current": {
+          "text": "Prometheus",
+          "value": "prometheus-main",
+          "selected": false
+        },
+        "options": [],
+        "regex": "",
+        "description": "Switch to an archived run's Prometheus to view it in these panels"
+      }
+    ]
+  }
 }
