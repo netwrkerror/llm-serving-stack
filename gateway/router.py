@@ -31,17 +31,23 @@ def classify(req: ChatCompletionRequest) -> str:
     return "balanced"
 
 
-def select_model(req: ChatCompletionRequest) -> str:
-    """
-    Override model selection based on prompt complexity.
-    If the client explicitly sets a model, respect it.
-    Otherwise route automatically.
-    """
-    if req.model != settings.default_model:
-        return req.model
+def resolve_route(req: ChatCompletionRequest) -> tuple[str, str]:
+    """Return (tier, model) for this request, classifying the prompt exactly once.
 
+    The tier is always reported, even when the client's own model wins, so the
+    X-Model-Tier header says what the heuristic thought regardless of what was used.
+
+    KNOWN GAP: "explicitly sets a model" is approximated as "asked for something other
+    than settings.default_model". A client that names default_model deliberately is
+    therefore indistinguishable from one that sent no preference at all, and gets
+    re-routed anyway. Stage 3 decides what "explicit" means — likely a model naming a
+    configured tier, or an explicit routing field — and this check changes with it.
+    """
     tier = classify(req)
-    return {
+    if req.model != settings.default_model:
+        return tier, req.model
+
+    return tier, {
         "fast": settings.model_fast,
         "balanced": settings.model_balanced,
         "powerful": settings.model_powerful,

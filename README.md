@@ -2,7 +2,7 @@
 
 A production-grade LLM inference stack built layer by layer — OpenAI-compatible gateway, Prometheus observability, Grafana dashboards, and benchmarking.
 
-Backed locally by [Ollama](https://ollama.com) (Metal-accelerated on Apple Silicon). Swappable with vLLM or TGI in production by changing one env var.
+Backed locally by [Ollama](https://ollama.com) (Metal-accelerated on Apple Silicon). Speaks the OpenAI protocol too, so vLLM or TGI can sit behind it; only tested against Ollama's own /v1 so far.
 
 ---
 
@@ -16,7 +16,7 @@ Client (curl / Python / OpenAI SDK)
 │     FastAPI Gateway        │  :8000
 │  ─────────────────────     │
 │  • OpenAI-compatible API   │
-│  • Async request queue     │  ← models vLLM's continuous batching scheduler
+│  • Async request queue     │  ← admission control: caps in-flight requests; batching is the backend's
 │  • SSE streaming           │  ← same wire format as vLLM / TGI
 │  • Prometheus metrics      │  ← TTFT, latency p95, TPS, queue depth
 └────────────┬───────────────┘
