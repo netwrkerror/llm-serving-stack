@@ -381,3 +381,55 @@ never in `.env` — the guard above enforces that). Each its own run directory, 
    JS-rendered, which is why fetching it returned only Llama 2 rows. Screenshot it, check
    the screenshot for account details before keeping it, and record price, date, URL.
    Cost per 1k requests from reported `usage`, per model, not per prompt set.
+
+**On the 8B cell — unified memory means swap can reach the generation, not just the
+host.** Calling the 17.3 GiB "VRAM" is a convenience; on Apple Silicon it is the same
+physical memory the OS is swapping out of. So host swap pressure is not merely noise
+around the measurement — it can touch the pages the model is generating from. That is a
+second, stronger reason to treat 1.899 s as an upper bound rather than this model's
+latency on this machine.
+
+*Rerun condition, recorded so it is not re-litigated later:* if the balanced-vs-powerful
+comparison ever rests on this cell, rerun it with everything else quit and the 8B resident
+alone — same n=10, c=1, `max_tokens=120`, same ten prompts — and compare against
+`run-local-8b-20261115-221501/`. Until that is done, any ratio derived from this cell
+carries the swap caveat with it.
+
+**On 346 vs 196 prompt tokens: it is the chat template, and the mechanism is more
+specific than "llama3.2 adds a preamble".** Verified by diffing `ollama show --template`
+for both models, then confirmed against the running gateway.
+
+Both templates contain the `Cutting Knowledge Date: December 2023` line, so the
+difference is not that one has it and the other does not — it is *when* each emits a
+system block at all:
+
+- `llama3.2:1b` opens `<|start_header_id|>system<|end_header_id|>` **unconditionally** and
+  always emits the cutoff line, whether or not the request has a system message or tools.
+- `llama3.1:8b` wraps the entire system block in `{{- if or .System .Tools }}`, and keeps
+  the cutoff line inside the `{{- if .Tools }}` branch. With neither a system message nor
+  tools — which is every prompt in this set — it emits **no system block whatsoever**.
+
+Measured on the gateway with one identical prompt, `max_tokens=4`:
+
+| | `llama3.2:1b` | `llama3.1:8b` | difference |
+|---|---|---|---|
+| no system message | 32 | 17 | **15** |
+| with a system message | 35 | 25 | 10 |
+
+15 tokens per request is exactly the aggregate gap: (346 − 196) / 10 = 15. The gap
+narrows to 10 once a system message is present, because the 8B then emits a block too
+while the 1B still carries its unconditional cutoff line. Same Llama 3 tokenizer in both;
+the tokenizer was never the variable.
+
+**Consequence, stated plainly: Converse applies its own template server-side, so local 8B
+and Bedrock 8B will also see different prompt tokens for an identical request.** The
+like-for-like cell is therefore "same weights, different prompt", not "same weights,
+different hosting". It is still the best controlled comparison available — the weights are
+the expensive variable and they are held fixed — but the write-up must not claim the
+prompt is identical, and cost-per-request must come from each cell's own reported `usage`.
+
+**Carried into Stage 4 before it is built:** the quality eval must record **prompt token
+count per prompt per cell**, alongside the pass/fail. Without it, a tier difference and a
+template difference are indistinguishable after the fact, and the only way to tell them
+apart is to re-run everything. With it, "did the 70B do better, or did it just receive a
+different prompt" is answerable from the saved records.
