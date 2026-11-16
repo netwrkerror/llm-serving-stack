@@ -115,3 +115,88 @@ first in one `TestClient` process can hit it, sync or streaming, and it is inter
 It is purely a test-harness artifact: the same four-request sequence against a real
 uvicorn server returns 200/200/200/404 with correct headers throughout. Live checks in
 this repo should go through a real server, not `TestClient`.
+
+## Stage 1 — client disconnect (2026-11-15)
+
+**The hypothesis was wrong, and that is the interesting part.** Ollama does not keep
+generating after a streaming client leaves: 89 of 90 measured disconnects were cancelled
+within 30–50 ms, wasting 1–3% of tokens. The upstream connection was already being closed
+— by CPython dropping the last reference to the suspended async generator and asyncio's
+finalizer hook scheduling `aclose()`. Nothing in the gateway was doing it on purpose,
+which is why it looked like a leak when reading the code.
+
+**What was actually broken was observability, and badly.** A cancelled request
+incremented *nothing*: the `done` branch never runs and `except Exception` does not catch
+the unwinding, so 60 disconnects produced no `stream="true"` row in `llm_requests_total`
+at all, and `llm_tokens_generated_total` stayed at the warm-up's 8. Real GPU time, zero
+trace on any dashboard. That is the defect worth writing about, and it is not the one we
+set out to find.
+
+**The fix is in `event_stream`'s `finally`, and it is weaker than it looks.** Reaching
+that `finally` depends on the same generator finalization that was already closing the
+upstream, so an explicit `aclose()` there cannot make cleanup deterministic — it only
+makes it *stated*. I had written a comment claiming it fixed the determinism problem;
+the measurements contradicted it and the comment is now corrected. Doing this properly
+needs disconnect detection outside the generator being cleaned up (an `http.disconnect`
+listener, or a pump task owned by the request). Not implemented, not tested, flagged in
+both the comment and `RESULTS.md`.
+
+**One disconnect out of 90 ran to its full 400 `max_tokens` anyway** — with the fix in
+place, no `cancel task` line, 2.738 s after the client left. 0 of 50 in `before` at c=4,
+1 of 40 in `after`. One event cannot separate the arms, so I have not claimed the fix
+caused it, and I have not claimed it is unrelated either. It is the clearest evidence
+that the cleanup path is not guaranteed, and it is exactly the behaviour the original
+hypothesis described — just rare rather than routine.
+
+**Two runs were silently invalid and I nearly wrote them up.** I launched the script
+through `/usr/local/bin/timeout`, which is an x86_64 binary, so the entire process tree
+ran under Rosetta — and Rosetta started the x86_64 half of Ollama's universal binary,
+which has no Metal. Ollama logged `inference compute id=cpu library=cpu` and ran at
+~33 tok/s instead of ~120–140. I caught it only because the transcript's `uname -m` said
+`x86_64` while `RESULTS.md` claims an M5 Pro. The before/after pair was internally
+consistent, so nothing looked wrong in the numbers themselves. Both runs are kept and
+labelled invalid; the script now aborts when `uname -m` disagrees with
+`hw.optional.arm64`, or when Ollama reports `library=cpu`.
+
+This also mattered for sensitivity, not just labelling: on CPU the cancel window is worth
+~1–3 tokens, so "almost nothing wasted" was partly an artifact of slow generation. On
+Metal the same 30–50 ms is worth ~5 tokens, and the 2.7 s outlier is worth 299.
+
+**A port collision wasted an hour and produced a confidently wrong conclusion.** A
+locally-run `uvicorn --port 8000` binds `127.0.0.1` while compose binds `*:8000`, and both
+can be up at once; requests then go to whichever the resolver prefers. I concluded from
+this that the `finally` block "never runs on disconnect" — it does, I was reading metrics
+from the compose container while exercising my local working copy. `run_disconnect.sh`
+now refuses to start if a non-docker process is listening on 8000. Note that `lsof`
+truncates COMMAND to 9 characters, so Docker Desktop appears as `com.docke` and a guard
+matching `docker` never fires — the first version of this check was itself broken.
+
+**Things the harness needed that were not obvious:**
+
+- `--after` has to be enforced by cancelling the read, not by checking the clock after
+  each chunk. The first version only looked at the deadline once a chunk had arrived, so
+  a request still waiting on its first token hung up late — 1.5 s instead of 0.5 s — which
+  quietly stops being a disconnect mid-generation.
+- Ollama's log has no sub-second timestamps and only puts them on `[GIN]` lines, so the
+  harness stamps lines itself as it tails them (50 ms poll).
+- A cancelled task prints no llama.cpp timing block, so `eval_count` is simply absent for
+  exactly the requests this experiment cares about. Total context minus prompt tokens
+  gives the same number; the report labels which source each row used.
+- Matching an HTTP request to an Ollama task needed a trick: each request is padded to a
+  unique prompt length, and tasks are rank-matched by the `task.n_tokens` the log reports.
+  No tokenizer knowledge required, only monotonicity.
+
+**Unsure / flagged:** tokens generated for a cancelled request are still not counted in
+`llm_tokens_generated_total`, because the gateway learns the count from a final chunk that
+never arrives. The log has it, but the gateway cannot see the log. Left as a known gap.
+Also untested: everything here is Ollama via `/api/chat`. Whether an OpenAI-compatible
+backend cancels as promptly is unknown, and Bedrock in Stage 2 has no streaming
+cancellation story I have verified at all.
+
+**One more copy of the ~400 ms figure, found late.** Stage 0 corrected it in the
+`_record_backend_timings` docstring, but the same misattribution was also in the README's
+trace-attribute table ("~400 ms for the last of four when `OLLAMA_NUM_PARALLEL=1`") and I
+missed it then. Same error as before: in that 2026-11-13 probe the 419 ms belonged to
+request #1 of four, and the actual last request was 148 ms. Now points at `RESULTS.md`
+like the docstring does. Worth remembering that a number which appears twice usually
+appears three times.

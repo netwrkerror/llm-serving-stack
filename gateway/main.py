@@ -21,6 +21,7 @@ from .metrics import (
     IN_FLIGHT,
     QUEUE_WAITING,
     REQUEST_COUNT,
+    REQUESTS_CANCELLED,
     REQUEST_DURATION,
     THROUGHPUT,
     TOKENS_GENERATED,
@@ -277,6 +278,14 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
 
     async def event_stream() -> AsyncIterator[str]:
         first_token_recorded = False
+        # Stays "cancelled" unless we reach the end of the stream or fail in-band.
+        # Nothing else can distinguish a client that hung up from one that waited:
+        # a disconnect unwinds this generator without raising anything catchable
+        # here, so the absence of a better outcome *is* the signal.
+        outcome = "cancelled"
+        # Counted here rather than taken from the backend's cumulative count, so a
+        # cancelled request can still report what the client actually received.
+        sent_tokens = 0
         try:
             with otel_trace.use_span(span, end_on_exit=False):
                 with otel_trace.use_span(inf_span, end_on_exit=False):
@@ -301,6 +310,7 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
                                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}],
                                 }
                                 yield f"data: {json.dumps(chunk)}\n\n"
+                                sent_tokens += 1
 
                             if done:
                                 # generation time drives throughput; end-to-end drives latency
@@ -339,6 +349,7 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
                                         "usage": usage,
                                     }) + "\n\n"
                                 yield "data: [DONE]\n\n"
+                                outcome = "completed"
                     except Exception as exc:
                         # Past the first chunk the status is already sent, so a failure
                         # can only be reported in-band. OpenAI's nested error shape: the
@@ -358,7 +369,55 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
                             }
                         }) + "\n\n"
                         yield "data: [DONE]\n\n"
+                        outcome = "error"
         finally:
+            # Close the backend generator here, not in _prepend, and before the slot
+            # is handed back.
+            #
+            # Here rather than _prepend: this closure owns the resources — agen, the
+            # slot, the spans — while _prepend is a generic adapter that owns nothing.
+            # Putting it there would also not help, because nothing holds a reference
+            # to the _prepend generator either (it is a temporary of the `async for`),
+            # so it has the identical finalization problem one level further down.
+            #
+            # Explicitly rather than implicitly: on a disconnect this generator is
+            # left suspended, and what closed the upstream even before this call
+            # existed was async-generator finalization — CPython dropping the last
+            # reference and asyncio's finalizer hook scheduling aclose(). Closing the
+            # backend by name says what we mean instead of relying on that cascade.
+            #
+            # What this does NOT do is make cleanup guaranteed, and the measurements
+            # say so. Reaching this `finally` depends on the same finalization, so
+            # when finalization is late the close is late too: in one disconnect out
+            # of ~90 measured, Ollama ran the request to its full max_tokens anyway
+            # (benchmark/RESULTS.md, "Client disconnect"). Typical behaviour is a
+            # cancel ~30-50ms after the client leaves, before and after this change.
+            # Making it deterministic needs disconnect detection that does not run
+            # inside the generator being cleaned up — an http.disconnect listener or
+            # a pump task owned by the request. Not done here; see RESULTS.md.
+            #
+            # Before the release because the ordering is cheap to get right: the slot
+            # used to be freed while the upstream request was still open, so briefly
+            # the gateway believed it had capacity Ollama was still using.
+            #
+            # Unconditional because the normal path has already exhausted agen, which
+            # makes this a no-op there.
+            try:
+                await agen.aclose()
+            except Exception as exc:  # never let cleanup mask the response
+                log.warning("backend_close_failed", extra={"model": model, "error": str(exc)})
+
+            if outcome == "cancelled":
+                REQUESTS_CANCELLED.labels(model=model).inc()
+                log.info("request_cancelled", extra={
+                    "model": model,
+                    "stream": True,
+                    "duration_s": round(time.perf_counter() - arrival, 3),
+                    "tokens_sent": sent_tokens,
+                })
+            span.set_attribute("llm.outcome", outcome)
+            inf_span.set_attribute("llm.outcome", outcome)
+
             _queue.release()
             IN_FLIGHT.labels(model=model).dec()
             inf_span.end()

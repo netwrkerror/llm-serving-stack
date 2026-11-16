@@ -42,6 +42,15 @@ QUEUE_WAITING = Gauge(
     ["model"],
 )
 
+REQUESTS_CANCELLED = Counter(
+    "llm_requests_cancelled_total",
+    "Streaming requests whose client went away before the stream finished. "
+    "Deliberately a separate counter rather than a status on llm_requests_total: "
+    "a cancelled request has no meaningful latency or token count, so folding it "
+    "into that counter would change what existing success/error ratios mean",
+    ["model"],
+)
+
 THROUGHPUT = Histogram(
     "llm_tokens_per_second",
     "Tokens generated per second",
