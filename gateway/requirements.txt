@@ -8,3 +8,8 @@ opentelemetry-api==1.27.0
 opentelemetry-sdk==1.27.0
 opentelemetry-exporter-otlp-proto-grpc==1.27.0
 python-json-logger==2.0.7
+# Bedrock. aioboto3, not boto3: a synchronous converse_stream pulled from a worker
+# thread cannot be cancelled, so a disconnected client would leave Bedrock generating
+# billable tokens. Imported lazily in backend.py, so the gateway still starts without
+# it as long as no tier is configured for bedrock.
+aioboto3==15.5.0

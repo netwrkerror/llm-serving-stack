@@ -1,6 +1,6 @@
 from typing import NamedTuple
 
-from .config import settings
+from .config import parse_tier_spec, settings
 from .schemas import ChatCompletionRequest
 
 # The value of `model` that asks the gateway to route by prompt content. Absent is
@@ -11,11 +11,13 @@ ROUTING_SENTINEL = "auto"
 class Route(NamedTuple):
     """Where a request is going, and whether the client chose it.
 
-    tier is None when an explicitly named model matches no configured tier.
+    tier is None when an explicitly named model matches no configured tier; kind is
+    still set in that case, because the request has to reach some backend.
     """
 
     tier: str | None
     model: str
+    kind: str
     explicit: bool
 
 
@@ -75,12 +77,31 @@ def resolve_route(req: ChatCompletionRequest) -> Route:
     pointing at a paid backend. Naming a model is now the way to say "this one, here".
 
     A named model that matches no configured tier is still honoured (the backend decides
-    whether it exists); it simply has no tier, and `tier` is None.
+    whether it exists); it simply has no tier, and `tier` is None. Such a request goes
+    to the default backend kind, since nothing says otherwise.
+
+    A client can also name the backend, as "kind:model" — e.g.
+    "bedrock:meta.llama3-2-1b-instruct-v1:0". That is the only way to reach a backend
+    no tier is configured for, and it is deliberately explicit: there is no heuristic
+    that guesses "this looks like a Bedrock model id", because guessing wrong there
+    means sending a request somewhere that charges for it.
     """
     requested = (req.model or "").strip()
 
     if not requested or requested == ROUTING_SENTINEL:
         tier = classify(req)
-        return Route(tier=tier, model=settings.tier_models[tier], explicit=False)
+        cfg = settings.resolve_tier(tier)
+        return Route(tier=tier, model=cfg.model, kind=cfg.kind, explicit=False)
 
-    return Route(tier=tier_for_model(requested), model=requested, explicit=True)
+    named_kind, model = parse_tier_spec(requested)
+    tier = tier_for_model(model)
+
+    if named_kind is not None:
+        # The client's kind wins, and the tier is only reported if it agrees — a tier
+        # whose backend differs is not the tier serving this request.
+        if tier is not None and settings.resolve_tier(tier).kind != named_kind:
+            tier = None
+        return Route(tier=tier, model=model, kind=named_kind, explicit=True)
+
+    kind = settings.resolve_tier(tier).kind if tier is not None else settings.backend
+    return Route(tier=tier, model=model, kind=kind, explicit=True)

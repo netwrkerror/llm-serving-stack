@@ -200,3 +200,184 @@ missed it then. Same error as before: in that 2026-11-13 probe the 419 ms belong
 request #1 of four, and the actual last request was 148 ms. Now points at `RESULTS.md`
 like the docstring does. Worth remembering that a number which appears twice usually
 appears three times.
+
+## Stage 2 — Bedrock backend (2026-11-15)
+
+**The model this stage was designed around no longer exists.** Llama 3.2 1B Instruct
+reached end of life on Bedrock on 2026-07-07, and so did 3.2 3B. The whole point of
+using 1B on both sides was to control for quality and isolate the backend; that is now
+impossible. The smallest Llama Bedrock still serves is 3.1 8B, against `llama3.2:1b`
+locally — 8× the parameters, so any comparison between them measures model *and*
+backend at once. `RESULTS.md` labels it as different models, as the stage plan required.
+
+**The cheaper fix nobody asked for: move the local side, not the remote one.** Bedrock's
+floor is 8B, but Ollama will happily run `llama3.1:8b`. Pulling that locally restores a
+genuine like-for-like comparison — same weights, same prompt set, one side local and one
+side billed — and it is a `ollama pull` plus a `GATEWAY_TIER_FAST` change, no code. I
+have not done it: it changes Part 1's local baseline model, which every earlier table in
+`RESULTS.md` is measured against, and that is a decision about the write-up rather than
+a gap in the code. Worth deciding before the cost table is built, because it is the
+difference between "Bedrock costs N× local" and "a 70B costs N× a 1B, also one is remote".
+
+**Bedrock's own index page is not an availability signal.** "Models at a glance" still
+links Llama 3.2 1B and 3B; both per-model cards say EOL and that calls fail with
+`ResourceNotFoundException`. I nearly recorded the index listing as confirmation. The
+per-model card is the authority, and it is the one with the dates on it.
+
+**Region availability is per-model and asymmetric, which is a config trap.** Llama 3.1 8B
+is in-region only in `us-west-2`; Llama 3.3 70B only in `us-east-2`. Anywhere else the
+geo inference id (`us.meta.…`) is required. So a tier string that works in one region
+fails in another, and the failure is a model-not-found rather than anything that hints at
+the real cause. Noted in `RESULTS.md` next to the ids.
+
+**Why async, concretely.** Using `boto3` in a thread would have made Stage 1's rare leak
+routine: a synchronous `converse_stream` drained from a worker thread cannot be
+cancelled, so every disconnect would bill for a full generation. With `aioboto3`, closing
+the event stream closes the connection, which gets us at least the finalization-driven
+behaviour measured on Ollama. `generate_stream` closes the stream in a `finally`, and
+there is a test that an early-exiting consumer closes it. Whether Bedrock then *stops
+billing* is untested and is the measurement that matters most here.
+
+**What the unit tests do and do not prove.** 33 tests cover the Converse mapping: system
+messages to `system` rather than the message list, `inferenceConfig`, usage translated to
+the `prompt_tokens`/`completion_tokens` keys the other backends use, usage arriving in a
+`metadata` event *after* `messageStop` (which is why `messageStop` is not treated as the
+end of the stream), empty deltas not counted as tokens, and the event stream being closed
+on early exit. All of it against synthetic events. The contract itself is unverified —
+if Bedrock's event shapes differ from the documented ones, every one of these tests still
+passes. The one real check I could make: constructing an actual `bedrock-runtime` client
+via aioboto3 and confirming it exposes `converse` and `converse_stream`, which it does,
+and that the docs' own Converse example matches the argument shape I build.
+
+**`health_check` lied until I looked at it.** Building a Bedrock client succeeds with no
+credentials at all, so the first version reported the backend healthy on a machine that
+cannot call AWS. It now resolves credentials explicitly and returns False when none
+exist — verified, since this machine is exactly that case. It still does not prove the
+model is callable or the caller is authorised, because that would mean paying for a
+health check; `/health` green means "configured", not "reachable".
+
+**Reaching Bedrock without pointing a tier at it.** The stage said Bedrock should be
+reachable when a client names a Bedrock model id, but a registry built only from
+configured tiers has no Bedrock client to hand such a request to — it returned a 503. The
+rule now is that setting `GATEWAY_AWS_REGION` is the operator opting in, and that builds
+the client even with all tiers local. Clients name it as `bedrock:<model-id>`; there is
+deliberately no heuristic that guesses whether a model id "looks like" Bedrock, because
+guessing wrong sends a request somewhere that charges for it.
+
+**A stale container made a routing test look like a routing bug.** `bedrock_compare.py`
+cell (b) sent `bedrock:<id>` and the request arrived at Ollama. That was the compose image
+still running Stage 1 code, which read the whole string as a model name. Against the new
+code the same request is a 503 naming the kinds that were built. Same family of mistake as
+the Stage 1 port collision: the thing answering was not the thing I was editing. Checking
+`X-Routed-Backend` on the response is the cheap way to tell.
+
+**Unsure / flagged:** the `llm_tokens_streamed_total` counter suggested after Stage 1 is
+deliberately not in this PR — it would give cancelled requests a non-zero lower bound on
+dashboards, but it is independent of Bedrock and this change is already large. The
+`/v1/models` endpoint now merges configured tier models with whatever each backend can
+enumerate, because Bedrock cannot enumerate itself from the runtime client; that is a
+behaviour change to an endpoint nothing in the benchmarks reads, and it is untested
+against a real multi-backend setup.
+
+**Untested edge, carried over from Stage 1 review:** if the client disconnects between
+`return StreamingResponse(...)` and Starlette's first `__anext__`, the generator body
+never starts, so its `finally` never runs — the slot, `IN_FLIGHT`, and both spans leak,
+and `llm_requests_cancelled_total` does not count it. The window is a few microseconds,
+so n=90 would not have seen it and did not. Not fixed, not measured. The
+`http.disconnect`-listener mechanism named in `RESULTS.md` would close this too, since
+cleanup would no longer live inside the generator being cleaned up — one more reason
+that is the right shape when it is built.
+
+**The TestClient event-loop bug is fixed, measured rather than predicted.** The
+mechanism was as described in review: `backend = _make_backend()` ran at import, so the
+`httpx.AsyncClient` and its pool were created outside any event loop, and TestClient
+drives each request through its own short-lived loop — a pooled connection from request 1
+belonged to a loop that was gone by request 2, which is why it was intermittent rather
+than constant. The Stage 2 registry builds clients inside `lifespan`, on the running
+loop, and `with TestClient(app):` is what runs `lifespan`. Verified: four consecutive
+requests alternating sync and streaming through one TestClient all return 200, where
+before the second could 500 with `Event loop is closed`.
+`tests/test_bedrock.py::test_registry_is_built_in_lifespan_and_closed_after` pins it with
+a fake backend, so it does not need a live Ollama.
+
+## Stage 2 follow-up — review fixes and the local 8B cell (2026-11-15)
+
+**The 8B fits, and the honest version of "fits" has three parts.** Metal, full offload
+(`offloaded 33/33 layers to GPU`), 6.87 GB resident against 17.3 GiB of VRAM — so the GPU
+was never the question. System memory was: the machine was *already* swapping ~12.8 GB
+before `llama3.1:8b` was pulled, and the run pushed swap to 17.7 GB with free memory down
+to 20%. So the 8B latency figures (e2e p50 1.899 s, 2.8× the 1B) are an upper bound for
+this host rather than a property of the model. Recorded as the result, since that is what
+was asked for; worth re-running on a quiet machine before anything leans on the ratio.
+
+**An unasked-for finding that affects the cost table: the same prompts are not the same
+number of input tokens across models.** The ten fixed prompts tokenize to 346 prompt
+tokens on `llama3.2:1b` and 196 on `llama3.1:8b` — different chat templates and
+tokenizers. Any "cost per 1k requests for the measured prompt set" is therefore
+per-model, not per-prompt-set, and comparing two models' costs on "the same prompts"
+silently compares different input-token counts. This is an argument for reading cost from
+reported `usage` per cell, which `bedrock_compare.py` already does, and never computing it
+once and reusing it.
+
+**The token-metric fix is the kind of change that could have silently rewritten history.**
+`TOKENS_GENERATED`/`THROUGHPUT` now prefer `usage.completion_tokens` over the delta count.
+On Ollama those are equal, so Part 1's numbers are untouched — but "should be equal" is
+not evidence, so it was checked against a running server: one 60-token request moved the
+metric by exactly 60, which matched both the reported usage and the content-chunk count.
+The 1B latency cell also reproduces the earlier run on the new build (0.204/0.678 against
+0.202/0.663). The fallback is load-bearing in one specific place: a cancelled request
+never receives the final chunk, so usage never arrives and the delta count is all there is.
+
+**`_bedrock_config`'s docstring was confidently wrong in the safe direction**, which is
+the easy kind to leave in. It claimed retries were left alone to avoid paying twice for a
+retried generation, while the code asks for standard mode (three attempts). The behaviour
+was fine — botocore retries throttles and pre-response failures, and a mid-stream failure
+is surfaced rather than retried, so a retried attempt generated nothing billable — but the
+comment described a decision that had not been made. Docstring now says what the code does.
+
+**The lifecycle check is the gateway's answer to this stage's main finding.** Nothing told
+us Llama 3.2 1B was being retired; at EOL, calls just start returning
+`ResourceNotFoundException`. Now every `bedrock` tier gets a `GetFoundationModel` lookup at
+startup (control-plane, not inference, so no bill) and one log line each: info when ACTIVE,
+**warning** when LEGACY, warning with the error when the call failed. It never blocks
+startup — the runtime role may well not hold `bedrock:GetFoundationModel`, and refusing to
+serve because a label could not be read would be worse than not knowing. Needs a second
+client (`bedrock`, not `bedrock-runtime`), built lazily on the same exit stack. Tested with
+an injected client, including the permission-denied and missing-field paths, plus a test
+that a fully local configuration makes no AWS call at startup at all. **Untested against
+the live API**, like everything else Bedrock-side.
+
+**The credential guard flagged its own source first.** `bedrock_compare.py` now refuses to
+run if AWS credentials appear in `.env`, `docker-compose.yml`, or any tracked file — but
+the first version matched the literal strings in its own help text and abort message, and
+would also have flagged `AWS_REGION: "${AWS_REGION}"`, which is correct passthrough rather
+than a leak. Both now pass: it skips itself, ignores `${...}` and `<...>` placeholders and
+empty values, and always flags key material (`AKIA…`, `ASIA…`, `aws_secret_access_key=`).
+Verified in all three directions — clean repo runs, a planted `.env` aborts, commented
+examples in compose do not fire. A guard that cries wolf is a guard people learn to skip.
+
+**Unsure / flagged:** the 8B cell was measured with both local models resident at once
+(1B 1.3 GB + 8B 6.87 GB), because one invocation runs both cells. That is additional
+memory pressure the single-model runs did not have, and it is the configuration the tier
+mapping implies anyway, so it was not separated out. If the 8B numbers get used for
+anything load-bearing, run it alone first and compare.
+
+**Next, when credentials arrive** (`AWS_PROFILE=serving-stack` in the launching shell,
+never in `.env` — the guard above enforces that). Each its own run directory, n=10, c=1,
+`max_tokens=120`, same prompt set:
+
+1. Bedrock direct, 8B — cell (a).
+2. Bedrock via the gateway, 8B — cell (b). Overhead is (b) − (a), reported with both p50s,
+   the region and the hour. Bedrock latency drifts, so no averaging across hours.
+3. Both cells again for whichever `powerful` model the startup lifecycle check reports
+   ACTIVE in the configured region.
+4. Disconnect cell on Bedrock, 8B, `disconnect.py` shape (read 1.0 s, drop the socket,
+   `max_tokens=400`). Billed tokens come from Bedrock model invocation logging to
+   CloudWatch Logs for the run window (per-invocation output token count), or failing that
+   the CloudWatch `OutputTokenCount` metric for the model id. Report billed-after-close as
+   tokens and as dollars per 1k disconnects. Until this runs, the cost table keeps its
+   "cancellation cost: untested" row.
+5. Prices from the pricing page in a browser with the Meta tab selected — it is
+   JS-rendered, which is why fetching it returned only Llama 2 rows. Screenshot it, check
+   the screenshot for account details before keeping it, and record price, date, URL.
+   Cost per 1k requests from reported `usage`, per model, not per prompt set.

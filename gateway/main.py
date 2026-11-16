@@ -13,7 +13,7 @@ from opentelemetry import trace as otel_trace
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .auth import APIKeyMiddleware
-from .backend import backend
+from .backend import Backend, make_backend
 from .config import settings
 from .limiter import rate_limiter
 from .logger import log
@@ -39,18 +39,105 @@ from .schemas import (
 
 _queue = asyncio.Semaphore(settings.max_concurrent_requests)
 
+# Backends by kind, built at startup and closed in lifespan. Module-level so the
+# request path can reach it without a singleton per backend; empty until lifespan
+# runs, which is also what makes it swappable in tests.
+_backends: dict[str, Backend] = {}
+
+
+def backend_for(kind: str) -> Backend:
+    """The backend serving a kind, built at startup.
+
+    A missing kind is a configuration error rather than a request error, but it
+    surfaces here because that is where it first matters.
+    """
+    try:
+        return _backends[kind]
+    except KeyError:
+        raise HTTPException(
+            status_code=503,
+            detail=f"no backend configured for kind {kind!r}; "
+                   f"built kinds are {sorted(_backends) or 'none'}",
+        )
+
+
+async def _log_bedrock_lifecycles() -> None:
+    """Report each Bedrock tier's model lifecycle status at startup.
+
+    This exists because the model this stack was first built around — Llama 3.2 1B —
+    reached end of life on Bedrock while the work was in progress, and nothing in the
+    gateway would have said so: calls simply start failing with ResourceNotFoundException.
+    A LEGACY warning at startup is the warning you want months before that.
+
+    GetFoundationModel is a control-plane call, not inference, so it does not bill.
+    It never blocks startup: the runtime role may not hold bedrock:GetFoundationModel,
+    and a missing label is not a reason to refuse to serve.
+    """
+    tiers = {t: cfg for t, cfg in settings.tiers.items() if cfg.kind == "bedrock"}
+    if not tiers:
+        return
+    impl = _backends.get("bedrock")
+    if impl is None or not hasattr(impl, "model_lifecycle"):
+        return
+
+    for tier, cfg in tiers.items():
+        status, error = await impl.model_lifecycle(cfg.model)
+        extra = {
+            "tier": tier,
+            "model": cfg.model,
+            "lifecycle": status,
+            "region": settings.aws_region or "(credential chain)",
+        }
+        if error:
+            log.warning("bedrock_lifecycle_unknown", extra={**extra, "error": error})
+        elif status.upper() == "LEGACY":
+            log.warning("bedrock_model_legacy", extra={
+                **extra,
+                "note": "model is in its legacy period and will reach end of life; "
+                        "calls start failing with ResourceNotFoundException at EOL",
+            })
+        else:
+            log.info("bedrock_model_lifecycle", extra=extra)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_tracing()
+    for kind in settings.active_kinds:
+        _backends[kind] = make_backend(kind)
+
+    remote = settings.remote_tiers
     log.info("gateway_starting", extra={
         "backend_kind": settings.backend,
         "backend": settings.backend_url,
         "queue_slots": settings.max_concurrent_requests,
         "tracing": settings.tracing_enabled,
+        "tiers": {t: str(cfg) for t, cfg in settings.tiers.items()},
+        "backend_kinds": sorted(_backends),
     })
+    # Stated explicitly, every start: a tier on a paid backend means automatic
+    # routing can spend money, and that should never be something you discover
+    # from a bill. Shipped defaults put all three tiers on the local backend.
+    if remote:
+        log.warning("remote_tiers_configured", extra={
+            "remote_tiers": {t: str(cfg) for t, cfg in remote.items()},
+            "note": "automatic routing can send requests to a paid backend",
+        })
+    else:
+        log.info("all_tiers_local", extra={
+            "tiers": {t: str(cfg) for t, cfg in settings.tiers.items()},
+        })
+
+    await _log_bedrock_lifecycles()
+
     yield
-    await backend.close()
+
+    for kind, impl in _backends.items():
+        try:
+            await impl.close()
+        except Exception as exc:  # one bad backend must not block the others
+            log.warning("backend_close_failed", extra={"kind": kind, "error": str(exc)})
+    _backends.clear()
     log.info("gateway_stopped")
 
 
@@ -72,25 +159,62 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    ok = await backend.health_check()
+    # Every built backend is checked, and "status" stays ok/degraded so the
+    # benchmark scripts' grep for '"status":"ok"' keeps working.
+    checks = {}
+    for kind, impl in _backends.items():
+        try:
+            checks[kind] = bool(await impl.health_check())
+        except Exception:
+            checks[kind] = False
     return {
-        "status": "ok" if ok else "degraded",
+        "status": "ok" if checks and all(checks.values()) else "degraded",
         "backend": settings.backend_url,
         "backend_kind": settings.backend,
+        "backends": checks,
+        "tiers": {t: str(cfg) for t, cfg in settings.tiers.items()},
         "queue_slots": settings.max_concurrent_requests,
     }
 
 
 @app.get("/v1/models")
 async def list_models():
-    try:
-        models = await backend.list_models()
-        return {
-            "object": "list",
-            "data": [{"id": m, "object": "model", "owned_by": settings.backend} for m in models],
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    """Models each backend reports, plus every configured tier model.
+
+    The tier models are added because a backend need not be able to enumerate
+    itself — Bedrock cannot, from the runtime client — and a configured model
+    should still be discoverable. A backend that fails to list is skipped rather
+    than failing the whole response; it would otherwise take the others down
+    with it.
+    """
+    seen: dict[str, str] = {}
+    errors: dict[str, str] = {}
+
+    for tier_cfg in settings.tiers.values():
+        seen.setdefault(tier_cfg.model, tier_cfg.kind)
+
+    for kind, impl in _backends.items():
+        try:
+            for model in await impl.list_models():
+                seen.setdefault(model, kind)
+        except Exception as exc:
+            errors[kind] = str(exc)
+
+    if not seen and errors:
+        raise HTTPException(status_code=503, detail="; ".join(
+            f"{k}: {v}" for k, v in errors.items()))
+
+    body: dict = {
+        "object": "list",
+        "data": [
+            {"id": model, "object": "model", "owned_by": kind}
+            for model, kind in sorted(seen.items())
+        ],
+    }
+    if errors:
+        # Surfaced rather than swallowed: a partial list should say so.
+        body["errors"] = errors
+    return body
 
 
 @app.get("/metrics")
@@ -121,22 +245,27 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     log.info("request_received", extra={
         "model": routed_model,
         "tier": tier,
+        "backend_kind": route.kind,
         "explicit_model": route.explicit,
         "stream": req.stream,
     })
 
+    impl = backend_for(route.kind)
+
     if req.stream:
-        resp: Response = await _stream_response(req, tier, arrival)
+        resp: Response = await _stream_response(req, tier, arrival, impl, route.kind)
     else:
         # JSONResponse rather than the Pydantic model directly, so the headers below
         # apply to both paths.
         try:
-            resp = JSONResponse(content=(await _sync_response(req, tier, arrival)).model_dump())
+            resp = JSONResponse(
+                content=(await _sync_response(req, tier, arrival, impl, route.kind)).model_dump())
         except _UpstreamFailure as fail:
             resp = _openai_error(fail.status, fail.message, fail.err_type)
 
     resp.headers["X-Model-Tier"] = tier
     resp.headers["X-Routed-Model"] = routed_model
+    resp.headers["X-Routed-Backend"] = route.kind
     return resp
 
 
@@ -149,9 +278,11 @@ async def _acquire_slot(model: str) -> None:
         QUEUE_WAITING.labels(model=model).dec()
 
 
-def _set_span_attrs(span, req: ChatCompletionRequest, tier: str) -> None:
+def _set_span_attrs(span, req: ChatCompletionRequest, tier: str, kind: str = "") -> None:
     span.set_attribute("llm.model", req.model)
     span.set_attribute("llm.tier", tier)
+    if kind:
+        span.set_attribute("llm.backend", kind)
     span.set_attribute("llm.stream", req.stream)
     span.set_attribute("llm.max_tokens", req.max_tokens or 512)
 
@@ -177,6 +308,25 @@ def _record_backend_timings(span, timings: dict) -> None:
     if "total_ms" in timings:
         phases = sum(timings.get(k, 0.0) for k in ("load_ms", "prompt_eval_ms", "eval_ms"))
         span.set_attribute("ollama.unattributed_ms", round(timings["total_ms"] - phases, 2))
+
+
+def _completion_tokens(meta: dict, delta_count: int) -> int:
+    """Generated tokens for the token and throughput metrics.
+
+    The backend's own count when it reports one, the streamed delta count otherwise.
+    These are not the same thing: for Ollama one delta is one token, so the two agree,
+    but a Converse `contentBlockDelta` can carry several tokens at once. Counting
+    deltas there would understate Bedrock throughput on the dashboards while the cost
+    table — which reads `usage` — was right, and the two would quietly disagree.
+
+    The fallback matters for more than safety: a cancelled request never receives the
+    final chunk, so usage never arrives and the delta count is all there is.
+    """
+    usage = meta.get("usage") or {}
+    reported = usage.get("completion_tokens")
+    if isinstance(reported, int) and reported >= 0:
+        return reported
+    return delta_count
 
 
 class _UpstreamFailure(Exception):
@@ -219,7 +369,8 @@ async def _prepend(first, rest: AsyncIterator) -> AsyncIterator:
         yield item
 
 
-async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float) -> Response:
+async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float,
+                           backend: Backend, kind: str) -> Response:
     """Open the backend stream and read its first chunk before returning a response.
 
     Once a StreamingResponse is returned, the 200 and the SSE content-type are already
@@ -234,7 +385,7 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
 
     IN_FLIGHT.labels(model=model).inc()
     span = t.start_span("llm.request")
-    _set_span_attrs(span, req, tier)
+    _set_span_attrs(span, req, tier, kind)
 
     acquired = False
     agen = None
@@ -317,16 +468,20 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
                                 duration = time.perf_counter() - gen_start
                                 e2e = time.perf_counter() - arrival
                                 _record_backend_timings(inf_span, meta.get("timings", {}))
+                                billed = _completion_tokens(meta, token_count)
                                 REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
                                 REQUEST_DURATION.labels(model=model, stream="true", status="success").observe(e2e)
-                                TOKENS_GENERATED.labels(model=model).inc(token_count)
-                                THROUGHPUT.labels(model=model).observe(token_count / duration if duration > 0 else 0)
+                                TOKENS_GENERATED.labels(model=model).inc(billed)
+                                THROUGHPUT.labels(model=model).observe(billed / duration if duration > 0 else 0)
                                 log.info("request_completed", extra={
                                     "model": model, "stream": True,
                                     "duration_s": round(e2e, 3),
                                     "generation_s": round(duration, 3),
-                                    "tokens": token_count,
-                                    "tps": round(token_count / duration if duration > 0 else 0, 1),
+                                    "tokens": billed,
+                                    # What the client actually received, which is a delta
+                                    # count and so not always the token count.
+                                    "tokens_sent": sent_tokens,
+                                    "tps": round(billed / duration if duration > 0 else 0, 1),
                                 })
                                 final = {
                                     "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -425,13 +580,14 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float) -> ChatCompletionResponse:
+async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float,
+                         backend: Backend, kind: str) -> ChatCompletionResponse:
     model = req.model
     t = get_tracer()
     IN_FLIGHT.labels(model=model).inc()
     try:
         with t.start_as_current_span("llm.request") as span:
-            _set_span_attrs(span, req, tier)
+            _set_span_attrs(span, req, tier, kind)
 
             with t.start_as_current_span("llm.queue.wait"):
                 await _acquire_slot(model)
@@ -450,12 +606,21 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float) 
                             "model": model, "error": str(exc), "http_status": status,
                         })
                         inf_span.record_exception(exc)
+                        # Same attribute as the streaming path, so a dashboard can
+                        # group by outcome without caring which path served it. There
+                        # is no "cancelled" here: a non-streaming client that hangs up
+                        # is not observable from inside this function — the response is
+                        # built before anything is written back.
+                        span.set_attribute("llm.outcome", "error")
+                        inf_span.set_attribute("llm.outcome", "error")
                         raise _UpstreamFailure(status, str(exc), err_type)
 
                     # generation time drives throughput; end-to-end drives latency
                     duration = time.perf_counter() - start
                     e2e = time.perf_counter() - arrival
                     _record_backend_timings(inf_span, meta.get("timings", {}))
+                    span.set_attribute("llm.outcome", "completed")
+                    inf_span.set_attribute("llm.outcome", "completed")
                     REQUEST_COUNT.labels(model=model, status="success", stream="false").inc()
                     REQUEST_DURATION.labels(model=model, stream="false", status="success").observe(e2e)
                     TOKENS_GENERATED.labels(model=model).inc(completion_tok)

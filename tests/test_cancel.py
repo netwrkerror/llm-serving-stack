@@ -52,10 +52,9 @@ def req(model: str = "fake-model") -> ChatCompletionRequest:
 
 
 @pytest.fixture
-def fake_backend(monkeypatch):
-    fake = FakeBackend()
-    monkeypatch.setattr(main, "backend", fake)
-    return fake
+def fake_backend():
+    """The backend is passed into _stream_response, so no patching is needed."""
+    return FakeBackend()
 
 
 def test_disconnect_closes_backend_and_counts_once(fake_backend):
@@ -66,7 +65,7 @@ async def _disconnect_closes_backend(fake_backend):
     model = "cancel-test"
     before = cancelled_count(model)
 
-    resp = await main._stream_response(req(model), "fast", 0.0)
+    resp = await main._stream_response(req(model), "fast", 0.0, fake_backend, "fake")
     body = resp.body_iterator
 
     # Read a couple of chunks, as a client would, then hang up.
@@ -91,7 +90,7 @@ async def _disconnect_releases_slot(fake_backend):
     """
     slots_before = main._queue._value
 
-    resp = await main._stream_response(req("slot-test"), "fast", 0.0)
+    resp = await main._stream_response(req("slot-test"), "fast", 0.0, fake_backend, "fake")
     body = resp.body_iterator
     await body.__anext__()
     assert main._queue._value == slots_before - 1, "slot was not taken"
@@ -100,11 +99,11 @@ async def _disconnect_releases_slot(fake_backend):
     assert main._queue._value == slots_before, "slot was not released on disconnect"
 
 
-def test_completed_stream_is_not_counted_as_cancelled(monkeypatch):
-    asyncio.run(_completed_not_cancelled(monkeypatch))
+def test_completed_stream_is_not_counted_as_cancelled():
+    asyncio.run(_completed_not_cancelled())
 
 
-async def _completed_not_cancelled(monkeypatch):
+async def _completed_not_cancelled():
     """Only an unfinished stream is a cancellation."""
 
     class FiniteBackend:
@@ -119,11 +118,10 @@ async def _completed_not_cancelled(monkeypatch):
                 self.closed = True
 
     fake = FiniteBackend()
-    monkeypatch.setattr(main, "backend", fake)
     model = "complete-test"
     before = cancelled_count(model)
 
-    resp = await main._stream_response(req(model), "fast", 0.0)
+    resp = await main._stream_response(req(model), "fast", 0.0, fake, "fake")
     chunks = [chunk async for chunk in resp.body_iterator]
 
     assert any("[DONE]" in c for c in chunks)
