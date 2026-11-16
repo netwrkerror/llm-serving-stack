@@ -12,6 +12,11 @@ _GUARDED = (
     "model_fast",
     "model_balanced",
     "model_powerful",
+    "backend",
+    "tier_fast",
+    "tier_balanced",
+    "tier_powerful",
+    "aws_region",
 )
 
 

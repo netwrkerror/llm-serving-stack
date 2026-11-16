@@ -14,6 +14,112 @@ not measured is not listed here.
 
 ---
 
+## Bedrock backend: model availability, and what is not measured (2026-11-15)
+
+The `BedrockBackend` is implemented and unit-tested. **No Bedrock call has been made
+from this repo.** There are no AWS credentials on this machine — no `~/.aws`, no
+`AWS_*` environment variables, no AWS CLI — so every Bedrock latency, cost and
+cancellation number below reads **untested**, not zero and not estimated.
+
+What *is* established: which Llama models Bedrock still offers, which is the headline
+finding, because it invalidates the comparison this stage was designed around.
+
+### Llama 3.2 1B is gone from Bedrock
+
+The plan was to run the same model locally and on Bedrock so quality was controlled and
+only the backend differed. That is no longer possible.
+
+| Model | Bedrock model id | Lifecycle | EOL date | Usable today |
+|-------|------------------|-----------|----------|--------------|
+| Llama 3.2 1B Instruct | `meta.llama3-2-1b-instruct-v1:0` | EOL | **2026-07-07** | **no** |
+| Llama 3.2 3B Instruct | `meta.llama3-2-3b-instruct-v1:0` | EOL | **2026-07-07** | **no** |
+| Llama 3.1 8B Instruct | `meta.llama3-1-8b-instruct-v1:0` | Legacy | 2027-03-30 | yes |
+| Llama 3.3 70B Instruct | `meta.llama3-3-70b-instruct-v1:0` | Legacy | 2027-03-30 | yes |
+
+Verified 2026-11-15 from the AWS model cards, which state for both 3.2 models:
+"reached end of life on July 7, 2026 and is no longer available. Requests to this model
+fail with `ResourceNotFoundException: This model version has reached the end of its
+life.`"
+
+- [Llama 3.2 1B Instruct](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-meta-llama-3-2-1b-instruct.html)
+- [Llama 3.2 3B Instruct](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-meta-llama-3-2-3b-instruct.html)
+- [Llama 3.1 8B Instruct](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-meta-llama-3-1-8b-instruct.html)
+- [Llama 3.3 70B Instruct](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-meta-llama-3-3-70b-instruct.html)
+
+Bedrock's own "Models at a glance" index still links Llama 3.2 1B and 3B; the index
+includes legacy and EOL cards, so it is not an availability signal. The per-model card is.
+
+**Consequence: the smallest Llama available on Bedrock is 8B, against `llama3.2:1b`
+locally — an 8× parameter difference. Any local-vs-Bedrock comparison using these is a
+comparison of *different models*, and must be labelled that way wherever it appears.**
+See `NOTES.md` for the cheaper alternative (pull `llama3.1:8b` locally instead), which
+would restore a controlled comparison and has not been done.
+
+Both candidate models are in **Legacy** lifecycle with EOL 2027-03-30. A cost table built
+on them has roughly four months of shelf life.
+
+**Configuration detail that will bite:** Llama 3.1 8B is not available *in-region* in
+`us-east-1` — only `us-west-2` is. Elsewhere the geo inference id is required:
+`us.meta.llama3-1-8b-instruct-v1:0`. Llama 3.3 70B is in-region only in `us-east-2`.
+Using the bare id in the wrong region fails rather than silently routing.
+
+### Untested: everything requiring an AWS call
+
+| Measurement | Status |
+|-------------|--------|
+| TTFT p50 / e2e p50, Bedrock direct via aioboto3 (cell a) | **untested** — no credentials |
+| TTFT p50 / e2e p50, Bedrock via the gateway (cell b) | **untested** — no credentials |
+| Gateway overhead on Bedrock, (b) − (a) | **untested** |
+| Bedrock on-demand prices for the models used | **untested** — see below |
+| Cost per 1k requests from reported usage | **untested** |
+| **Cancellation cost: tokens billed after client disconnect** | **untested** |
+| Converse event mapping against the live API | **untested** — unit-tested against synthetic events only |
+
+**Prices are not recorded.** <https://aws.amazon.com/bedrock/pricing/> was fetched on
+2026-11-15; its Meta section lists Llama 3.2 and 3.3 in the headings but renders token
+prices only for Llama 2, so no per-1k-token figure for the models above could be read
+off it. Rather than copy a price from a third-party aggregator, this row stays untested.
+
+**Cancellation cost is the row that decides a design question.** Stage 1 measured that a
+disconnected client on Ollama wastes 1–3% of generated tokens, and that the cleanup path
+is not guaranteed (1 full generation in 90). On a laptop that costs watts. On Bedrock it
+costs money, and the gateway cannot see Ollama's log trick to count it. When credentials
+exist, the source of truth is Bedrock model invocation logging (per-invocation output
+token count) or, coarser, the CloudWatch `OutputTokenCount` metric for the model id over
+the run window, compared against tokens the client actually received — reported as
+dollars per 1000 disconnects.
+
+### The one measured cell: local baseline
+
+Runnable without AWS, so it was run. This is the (c) cell of
+`benchmark/bedrock_compare.py` and the baseline the Bedrock cells will be compared against.
+
+**Conditions**
+
+| | |
+|---|---|
+| Date | 2026-11-15, 21:00 MST |
+| Hardware | Apple M5 Pro (`Mac17,9`), arm64 |
+| Ollama | 0.32.5, `library=Metal` verified from the server log, `OLLAMA_NUM_PARALLEL:4` |
+| Model | `llama3.2:1b` |
+| Gateway | compose image built from `377bf00` (Stage 1), 4 queue slots, `GATEWAY_BACKEND=ollama` |
+| Load | streaming, n=10, c=1, `max_tokens=120`, 10 fixed prompts (see `bedrock_compare.py`) |
+| Run dir | `benchmark/out/run-bedrock-compare-20261115-210022/` |
+
+| cell | backend | model | n | TTFT p50 | e2e p50 | tokens p50 | usage reported |
+|------|---------|-------|---|----------|---------|------------|----------------|
+| local-gateway | ollama | `llama3.2:1b` | 10 | 0.202 s | 0.663 s | 58 | yes |
+
+Reported usage over the 10 requests: 346 prompt tokens, 584 completion tokens.
+Marginal cost of these 10 requests locally: **not measured** — the laptop has not been
+metered. Not "$0".
+
+The same run exercised cells (a) and (b), which declined cleanly: (a) reported "no AWS
+credentials resolved from the standard chain", (b) was not given a model id and refused
+rather than assuming one. Those refusals are in the run directory's `report.txt`.
+
+---
+
 ## Client disconnect: what happens upstream (2026-11-15)
 
 The hypothesis under test was that when a streaming client hangs up, the gateway releases

@@ -14,6 +14,24 @@ services:
       GATEWAY_MAX_CONCURRENT_REQUESTS: "4"
       GATEWAY_TRACING_ENABLED: "true"
       GATEWAY_OTLP_ENDPOINT: "http://jaeger:4317"
+      # Per-tier backends: "kind:model", kind in ollama|openai|bedrock. A bare model
+      # name uses GATEWAY_BACKEND as its kind. Unset means every tier resolves to the
+      # local default, which is how this ships — nothing in automatic routing can
+      # reach a paid backend unless you set one of these.
+      #
+      # GATEWAY_TIER_FAST: "ollama:llama3.2:1b"
+      # GATEWAY_TIER_POWERFUL: "bedrock:<model-id>"
+      # GATEWAY_AWS_REGION: "us-east-1"
+      #
+      # Credentials come from the standard AWS chain and must never be written here.
+      # To give the container the host's credentials, mount them read-only and point
+      # the SDK at them, or pass a role's env vars in from your shell:
+      #   volumes:
+      #     - ~/.aws:/home/app/.aws:ro
+      #   environment:
+      #     AWS_PROFILE: "${AWS_PROFILE}"
+      #     AWS_REGION: "${AWS_REGION}"
+      # .env is gitignored; keep keys out of this file and out of the image.
     networks:
       - stack
     restart: unless-stopped

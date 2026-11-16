@@ -66,7 +66,8 @@ VRAM, which is what makes aggressive batching practical.
 | `gateway/` | FastAPI app — admission control, sync + streaming inference, routing, auth, rate limiting |
 | `observability/` | Prometheus + Grafana, Jaeger traces, Loki/Promtail logs |
 | `benchmark/` | 5-scenario load test, ending oversubscribed so gateway queueing shows up |
-| Routing | `model` absent or `"auto"` picks a tier from prompt complexity; naming a model is honoured as-is. `X-Model-Tier` / `X-Routed-Model` on the response |
+| Routing | `model` absent or `"auto"` picks a tier from prompt complexity; naming a model is honoured as-is. Each tier names its own backend, so the tier picks where the request goes. `X-Model-Tier` / `X-Routed-Model` / `X-Routed-Backend` on the response |
+| Backends | `ollama`, `openai` (vLLM / TGI / Ollama's `/v1`), and `bedrock` (Converse API, async via aioboto3). Built per kind at startup, closed on shutdown. **Bedrock is untested against the live API** — see [benchmark/RESULTS.md](benchmark/RESULTS.md) |
 | Auth | API key middleware — **off by default**, set `GATEWAY_AUTH_ENABLED` and `GATEWAY_API_KEYS` |
 | Rate limiting | Per-key requests/min and token budget — **off by default**, set `GATEWAY_RATE_LIMIT_ENABLED` |
 | Tracing | OpenTelemetry spans — **tested with Jaeger only**; any OTLP collector should work, untested |
@@ -308,7 +309,10 @@ with no configuration; turn them on explicitly.
 
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `GATEWAY_BACKEND` | `ollama` | `ollama` or `openai` |
+| `GATEWAY_BACKEND` | `ollama` | `ollama` or `openai`. The default **kind** for any tier that does not name its own |
+| `GATEWAY_TIER_FAST` / `_BALANCED` / `_POWERFUL` | _(empty → local)_ | `kind:model`, kind in `ollama` \| `openai` \| `bedrock`, e.g. `bedrock:<model-id>`. A bare model name uses `GATEWAY_BACKEND` as its kind. **All three ship empty, so nothing in automatic routing can reach a paid backend unless you set one** |
+| `GATEWAY_AWS_REGION` | _(empty → credential chain)_ | Bedrock region. Credentials come from the standard AWS chain only — never from config |
+| `GATEWAY_BEDROCK_TIMEOUT` | `120.0` | read timeout for Bedrock calls, seconds |
 | `GATEWAY_BACKEND_URL` | `http://localhost:11434` | must match the protocol — add `/v1` for `openai` |
 | `GATEWAY_BACKEND_API_KEY` | _(empty)_ | sent as a bearer token when set |
 | `GATEWAY_MAX_CONCURRENT_REQUESTS` | `4` | slot count; requests beyond this wait |

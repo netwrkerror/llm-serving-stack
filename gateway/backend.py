@@ -1,3 +1,5 @@
+import asyncio
+import inspect
 import json
 from typing import AsyncIterator, Protocol
 
@@ -226,10 +228,220 @@ class OpenAICompatBackend:
         await self.client.aclose()
 
 
-def _make_backend() -> Backend:
-    if settings.backend == "openai":
+def _to_converse(req: ChatCompletionRequest) -> dict:
+    """ChatCompletionRequest -> Converse arguments.
+
+    System messages go in `system`, not the message list — Converse rejects a
+    "system" role inside `messages`. Everything else becomes a one-text-block
+    message. Consecutive same-role messages are *not* merged; Converse wants
+    strict alternation and will complain, which is a clearer failure than this
+    function silently rewriting the conversation.
+    """
+    system = [{"text": m.content} for m in req.messages if m.role == "system"]
+    messages = [
+        {"role": m.role, "content": [{"text": m.content}]}
+        for m in req.messages
+        if m.role != "system"
+    ]
+    args: dict = {
+        "modelId": req.model,
+        "messages": messages,
+        "inferenceConfig": {
+            "maxTokens": req.max_tokens or 512,
+            "temperature": req.temperature,
+            "topP": req.top_p,
+        },
+    }
+    if system:
+        args["system"] = system
+    return args
+
+
+def _converse_usage(usage: dict) -> dict[str, int]:
+    """Converse usage -> the same keys the other backends report.
+
+    Converse says inputTokens/outputTokens; the gateway's usage chunk and the
+    OpenAI protocol say prompt_tokens/completion_tokens. Translated here so one
+    shape reaches the client regardless of backend.
+    """
+    prompt = usage.get("inputTokens")
+    completion = usage.get("outputTokens")
+    if not isinstance(prompt, int) or not isinstance(completion, int):
+        return {}
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": usage.get("totalTokens", prompt + completion),
+    }
+
+
+class BedrockBackend:
+    """Amazon Bedrock via the Converse API.
+
+    Async on purpose. A synchronous boto3 call pulled from a worker thread cannot
+    be cancelled: on client disconnect the thread goes on draining the event
+    stream to the end, and Bedrock bills for every token it produces. With an
+    async client, closing the response stream closes the HTTP connection, which
+    gives at least the same finalization-driven cancellation measured against
+    Ollama in benchmark/RESULTS.md.
+
+    Credentials come from the standard chain only — never from settings.
+
+    UNVERIFIED against the live API: written from the Converse event contract, but
+    at the time of writing this repo had no AWS credentials available, so no call
+    has been made. The event mapping is covered by unit tests with synthetic
+    events, which proves the mapping and not the contract.
+    """
+
+    def __init__(self, client=None) -> None:
+        # An injected client is how the tests avoid needing AWS at all.
+        self._client = client
+        self._injected = client is not None
+        self._stack = None
+        self._lock = asyncio.Lock()
+
+    async def _get_client(self):
+        if self._client is not None:
+            return self._client
+        async with self._lock:
+            if self._client is not None:
+                return self._client
+            try:
+                import aioboto3
+            except ImportError as exc:  # pragma: no cover - depends on the image
+                raise RuntimeError(
+                    "the bedrock backend needs aioboto3 (see gateway/requirements.txt). "
+                    "Synchronous boto3 is deliberately not used: a converse_stream call "
+                    "in a worker thread cannot be cancelled on client disconnect."
+                ) from exc
+
+            from contextlib import AsyncExitStack
+
+            session = aioboto3.Session()
+            kwargs = {"config": _bedrock_config()}
+            if settings.aws_region:
+                kwargs["region_name"] = settings.aws_region
+            self._stack = AsyncExitStack()
+            self._client = await self._stack.enter_async_context(
+                session.client("bedrock-runtime", **kwargs)
+            )
+            return self._client
+
+    async def health_check(self) -> bool:
+        """Region resolves, credentials resolve, and a client can be built.
+
+        Deliberately NOT an inference call — that would bill for a health check —
+        so this does not prove the configured model exists or that the caller is
+        allowed to invoke it. A green check here means "configured", not
+        "reachable". Credentials are checked explicitly because building a client
+        succeeds without any, which would otherwise report a healthy backend on a
+        machine that cannot call Bedrock at all.
+        """
+        try:
+            client = await self._get_client()
+            if client is None:
+                return False
+            if self._injected:
+                return True
+            import aioboto3
+
+            creds = aioboto3.Session().get_credentials()
+            if inspect.isawaitable(creds):
+                creds = await creds
+            return creds is not None
+        except Exception:
+            return False
+
+    async def list_models(self) -> list[str]:
+        """Empty: enumerating Bedrock models needs the `bedrock` control-plane
+        client and ListFoundationModels, which this backend does not hold. The
+        gateway adds configured tier models to /v1/models itself, so a configured
+        Bedrock model is still discoverable. Untested."""
+        return []
+
+    async def generate(self, req: ChatCompletionRequest) -> tuple[str, int, int, dict]:
+        client = await self._get_client()
+        resp = await client.converse(**_to_converse(req))
+        blocks = (resp.get("output", {}).get("message", {}) or {}).get("content", []) or []
+        text = "".join(b.get("text", "") for b in blocks)
+        usage = _converse_usage(resp.get("usage", {}) or {})
+        return (
+            text,
+            usage.get("prompt_tokens", 0),
+            usage.get("completion_tokens", 0),
+            # No timings: Converse reports metrics.latencyMs for the whole call, which
+            # is not a phase breakdown, so there is nothing to put in the shape
+            # _record_backend_timings expects.
+            {"timings": {}, "usage": usage},
+        )
+
+    async def generate_stream(self, req: ChatCompletionRequest) -> AsyncIterator[tuple[str, bool, int, dict]]:
+        """Yields (token, is_done, cumulative_token_count, meta), as the others do.
+
+        Converse's usage arrives in a `metadata` event, which may come after
+        `messageStop`. The final tuple is therefore emitted once the event stream
+        ends, so usage is whatever the stream actually reported by then.
+        """
+        client = await self._get_client()
+        resp = await client.converse_stream(**_to_converse(req))
+
+        token_count = 0
+        usage: dict = {}
+        stream = resp["stream"]
+        try:
+            async for event in stream:
+                if "contentBlockDelta" in event:
+                    token = (event["contentBlockDelta"].get("delta", {}) or {}).get("text", "")
+                    if token:
+                        token_count += 1
+                        yield token, False, token_count, {}
+                elif "metadata" in event:
+                    reported = event["metadata"].get("usage", {}) or {}
+                    if reported:
+                        usage = _converse_usage(reported)
+                # messageStart / contentBlockStop / messageStop carry no text and no
+                # usage. messageStop is not treated as the end: metadata follows it.
+        finally:
+            # Closing the event stream closes the underlying connection, which is the
+            # whole reason this backend is async. Without it, a disconnect would leave
+            # Bedrock generating billable tokens nobody reads.
+            close = getattr(stream, "close", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+
+        yield "", True, token_count, {"timings": {}, "usage": usage}
+
+    async def close(self) -> None:
+        if self._stack is not None:
+            await self._stack.aclose()
+            self._stack = None
+        self._client = None
+
+
+def _bedrock_config():
+    """botocore Config for the runtime client.
+
+    Retries are left at botocore's default rather than raised: a retried
+    converse_stream is a second billable generation, so the gateway should surface
+    the failure instead of quietly paying twice.
+    """
+    from botocore.config import Config
+
+    return Config(
+        read_timeout=settings.bedrock_timeout,
+        connect_timeout=10,
+        retries={"mode": "standard"},
+    )
+
+
+def make_backend(kind: str) -> Backend:
+    """Build one backend by kind. The registry in main.py owns the instances."""
+    if kind == "openai":
         return OpenAICompatBackend()
-    return OllamaBackend()
-
-
-backend: Backend = _make_backend()
+    if kind == "bedrock":
+        return BedrockBackend()
+    if kind == "ollama":
+        return OllamaBackend()
+    raise ValueError(f"unknown backend kind: {kind!r}")
