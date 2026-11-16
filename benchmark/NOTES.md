@@ -299,3 +299,85 @@ requests alternating sync and streaming through one TestClient all return 200, w
 before the second could 500 with `Event loop is closed`.
 `tests/test_bedrock.py::test_registry_is_built_in_lifespan_and_closed_after` pins it with
 a fake backend, so it does not need a live Ollama.
+
+## Stage 2 follow-up — review fixes and the local 8B cell (2026-11-15)
+
+**The 8B fits, and the honest version of "fits" has three parts.** Metal, full offload
+(`offloaded 33/33 layers to GPU`), 6.87 GB resident against 17.3 GiB of VRAM — so the GPU
+was never the question. System memory was: the machine was *already* swapping ~12.8 GB
+before `llama3.1:8b` was pulled, and the run pushed swap to 17.7 GB with free memory down
+to 20%. So the 8B latency figures (e2e p50 1.899 s, 2.8× the 1B) are an upper bound for
+this host rather than a property of the model. Recorded as the result, since that is what
+was asked for; worth re-running on a quiet machine before anything leans on the ratio.
+
+**An unasked-for finding that affects the cost table: the same prompts are not the same
+number of input tokens across models.** The ten fixed prompts tokenize to 346 prompt
+tokens on `llama3.2:1b` and 196 on `llama3.1:8b` — different chat templates and
+tokenizers. Any "cost per 1k requests for the measured prompt set" is therefore
+per-model, not per-prompt-set, and comparing two models' costs on "the same prompts"
+silently compares different input-token counts. This is an argument for reading cost from
+reported `usage` per cell, which `bedrock_compare.py` already does, and never computing it
+once and reusing it.
+
+**The token-metric fix is the kind of change that could have silently rewritten history.**
+`TOKENS_GENERATED`/`THROUGHPUT` now prefer `usage.completion_tokens` over the delta count.
+On Ollama those are equal, so Part 1's numbers are untouched — but "should be equal" is
+not evidence, so it was checked against a running server: one 60-token request moved the
+metric by exactly 60, which matched both the reported usage and the content-chunk count.
+The 1B latency cell also reproduces the earlier run on the new build (0.204/0.678 against
+0.202/0.663). The fallback is load-bearing in one specific place: a cancelled request
+never receives the final chunk, so usage never arrives and the delta count is all there is.
+
+**`_bedrock_config`'s docstring was confidently wrong in the safe direction**, which is
+the easy kind to leave in. It claimed retries were left alone to avoid paying twice for a
+retried generation, while the code asks for standard mode (three attempts). The behaviour
+was fine — botocore retries throttles and pre-response failures, and a mid-stream failure
+is surfaced rather than retried, so a retried attempt generated nothing billable — but the
+comment described a decision that had not been made. Docstring now says what the code does.
+
+**The lifecycle check is the gateway's answer to this stage's main finding.** Nothing told
+us Llama 3.2 1B was being retired; at EOL, calls just start returning
+`ResourceNotFoundException`. Now every `bedrock` tier gets a `GetFoundationModel` lookup at
+startup (control-plane, not inference, so no bill) and one log line each: info when ACTIVE,
+**warning** when LEGACY, warning with the error when the call failed. It never blocks
+startup — the runtime role may well not hold `bedrock:GetFoundationModel`, and refusing to
+serve because a label could not be read would be worse than not knowing. Needs a second
+client (`bedrock`, not `bedrock-runtime`), built lazily on the same exit stack. Tested with
+an injected client, including the permission-denied and missing-field paths, plus a test
+that a fully local configuration makes no AWS call at startup at all. **Untested against
+the live API**, like everything else Bedrock-side.
+
+**The credential guard flagged its own source first.** `bedrock_compare.py` now refuses to
+run if AWS credentials appear in `.env`, `docker-compose.yml`, or any tracked file — but
+the first version matched the literal strings in its own help text and abort message, and
+would also have flagged `AWS_REGION: "${AWS_REGION}"`, which is correct passthrough rather
+than a leak. Both now pass: it skips itself, ignores `${...}` and `<...>` placeholders and
+empty values, and always flags key material (`AKIA…`, `ASIA…`, `aws_secret_access_key=`).
+Verified in all three directions — clean repo runs, a planted `.env` aborts, commented
+examples in compose do not fire. A guard that cries wolf is a guard people learn to skip.
+
+**Unsure / flagged:** the 8B cell was measured with both local models resident at once
+(1B 1.3 GB + 8B 6.87 GB), because one invocation runs both cells. That is additional
+memory pressure the single-model runs did not have, and it is the configuration the tier
+mapping implies anyway, so it was not separated out. If the 8B numbers get used for
+anything load-bearing, run it alone first and compare.
+
+**Next, when credentials arrive** (`AWS_PROFILE=serving-stack` in the launching shell,
+never in `.env` — the guard above enforces that). Each its own run directory, n=10, c=1,
+`max_tokens=120`, same prompt set:
+
+1. Bedrock direct, 8B — cell (a).
+2. Bedrock via the gateway, 8B — cell (b). Overhead is (b) − (a), reported with both p50s,
+   the region and the hour. Bedrock latency drifts, so no averaging across hours.
+3. Both cells again for whichever `powerful` model the startup lifecycle check reports
+   ACTIVE in the configured region.
+4. Disconnect cell on Bedrock, 8B, `disconnect.py` shape (read 1.0 s, drop the socket,
+   `max_tokens=400`). Billed tokens come from Bedrock model invocation logging to
+   CloudWatch Logs for the run window (per-invocation output token count), or failing that
+   the CloudWatch `OutputTokenCount` metric for the model id. Report billed-after-close as
+   tokens and as dollars per 1k disconnects. Until this runs, the cost table keeps its
+   "cancellation cost: untested" row.
+5. Prices from the pricing page in a browser with the Meta tab selected — it is
+   JS-rendered, which is why fetching it returned only Llama 2 rows. Screenshot it, check
+   the screenshot for account details before keeping it, and record price, date, URL.
+   Cost per 1k requests from reported `usage`, per model, not per prompt set.

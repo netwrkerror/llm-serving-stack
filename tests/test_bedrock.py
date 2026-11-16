@@ -396,3 +396,117 @@ def test_setting_a_region_makes_bedrock_reachable_by_name():
 def test_no_region_and_no_tier_means_no_bedrock_client_is_built():
     settings.aws_region = ""
     assert settings.active_kinds == ["ollama"]
+
+
+# --- model lifecycle check (startup) --------------------------------------------------
+
+class FakeControlClient:
+    """The `bedrock` control-plane client, which only GetFoundationModel is used from."""
+
+    def __init__(self, status="ACTIVE", raises=None):
+        self._status = status
+        self._raises = raises
+        self.calls = []
+
+    async def get_foundation_model(self, modelIdentifier):
+        self.calls.append(modelIdentifier)
+        if self._raises:
+            raise self._raises
+        return {"modelDetails": {"modelLifecycle": {"status": self._status}}}
+
+
+def lifecycle_of(status=None, raises=None):
+    async def run():
+        control = FakeControlClient(status=status or "ACTIVE", raises=raises)
+        backend = BedrockBackend(client=object(), control_client=control)
+        result = await backend.model_lifecycle("meta.llama3-3-70b-instruct-v1:0")
+        return result, control
+    return asyncio.run(run())
+
+
+def test_lifecycle_reports_active():
+    (status, error), control = lifecycle_of("ACTIVE")
+    assert (status, error) == ("ACTIVE", None)
+    assert control.calls == ["meta.llama3-3-70b-instruct-v1:0"]
+
+
+def test_lifecycle_reports_legacy():
+    (status, error), _ = lifecycle_of("LEGACY")
+    assert (status, error) == ("LEGACY", None)
+
+
+def test_lifecycle_swallows_a_permission_error():
+    """The runtime role may not hold bedrock:GetFoundationModel.
+
+    A missing label must never stop the gateway from serving, so this reports
+    "unknown" plus the reason instead of raising.
+    """
+    (status, error), _ = lifecycle_of(raises=PermissionError("AccessDeniedException"))
+    assert status == "unknown"
+    assert "AccessDeniedException" in error
+
+
+def test_lifecycle_reports_unknown_when_the_field_is_missing():
+    async def run():
+        class Sparse:
+            async def get_foundation_model(self, modelIdentifier):
+                return {"modelDetails": {}}
+        return await BedrockBackend(client=object(), control_client=Sparse()).model_lifecycle("m")
+
+    status, error = asyncio.run(run())
+    assert (status, error) == ("unknown", None)
+
+
+def test_startup_logs_lifecycle_only_for_bedrock_tiers(monkeypatch):
+    """Local-only configuration must not make any AWS call at startup."""
+    asked: list[str] = []
+
+    class Spy:
+        async def model_lifecycle(self, model_id):
+            asked.append(model_id)
+            return "LEGACY", None
+
+    monkeypatch.setitem(main._backends, "bedrock", Spy())
+
+    # All tiers local: nothing to ask about.
+    asyncio.run(main._log_bedrock_lifecycles())
+    assert asked == []
+
+    settings.tier_powerful = "bedrock:meta.llama3-3-70b-instruct-v1:0"
+    asyncio.run(main._log_bedrock_lifecycles())
+    assert asked == ["meta.llama3-3-70b-instruct-v1:0"]
+    main._backends.clear()
+
+
+def test_startup_lifecycle_is_a_noop_without_a_bedrock_backend():
+    """Configured but not built — must not raise during startup."""
+    settings.tier_powerful = "bedrock:some.model-v1:0"
+    main._backends.clear()
+    asyncio.run(main._log_bedrock_lifecycles())
+
+
+# --- token accounting -----------------------------------------------------------------
+
+def test_completion_tokens_prefers_the_backend_count():
+    """A Converse contentBlockDelta can carry several tokens, so deltas undercount."""
+    meta = {"usage": {"prompt_tokens": 7, "completion_tokens": 42}}
+    assert main._completion_tokens(meta, 10) == 42
+
+
+def test_completion_tokens_falls_back_to_the_delta_count():
+    """No usage: a cancelled request never gets the final chunk, so deltas are all
+    there is. Also the case for any backend that reports no usage at all."""
+    assert main._completion_tokens({}, 10) == 10
+    assert main._completion_tokens({"usage": {}}, 10) == 10
+    assert main._completion_tokens({"usage": {"prompt_tokens": 7}}, 10) == 10
+
+
+def test_completion_tokens_ignores_a_non_integer_count():
+    assert main._completion_tokens({"usage": {"completion_tokens": None}}, 10) == 10
+    assert main._completion_tokens({"usage": {"completion_tokens": "42"}}, 10) == 10
+
+
+def test_completion_tokens_agrees_with_deltas_on_ollama():
+    """On Ollama one delta is one token, so eval_count equals the chunk count and
+    this change cannot move Part 1's numbers."""
+    assert main._completion_tokens({"usage": {"completion_tokens": 58}}, 58) == 58

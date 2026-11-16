@@ -293,12 +293,58 @@ class BedrockBackend:
     events, which proves the mapping and not the contract.
     """
 
-    def __init__(self, client=None) -> None:
-        # An injected client is how the tests avoid needing AWS at all.
+    def __init__(self, client=None, control_client=None) -> None:
+        # Injected clients are how the tests avoid needing AWS at all.
         self._client = client
         self._injected = client is not None
+        self._control_client = control_client
+        self._control_injected = control_client is not None
         self._stack = None
         self._lock = asyncio.Lock()
+
+    async def _get_control_client(self):
+        """The `bedrock` control-plane client, separate from `bedrock-runtime`.
+
+        Only used for GetFoundationModel, which reports lifecycle status and is not
+        an inference call, so it does not bill.
+        """
+        if self._control_client is not None:
+            return self._control_client
+        async with self._lock:
+            if self._control_client is not None:
+                return self._control_client
+            import aioboto3
+            from contextlib import AsyncExitStack
+
+            if self._stack is None:
+                self._stack = AsyncExitStack()
+            kwargs = {}
+            if settings.aws_region:
+                kwargs["region_name"] = settings.aws_region
+            self._control_client = await self._stack.enter_async_context(
+                aioboto3.Session().client("bedrock", **kwargs)
+            )
+            return self._control_client
+
+    async def model_lifecycle(self, model_id: str) -> tuple[str, str | None]:
+        """(status, error) for a model id, via GetFoundationModel.
+
+        status is Bedrock's modelLifecycle.status — ACTIVE or LEGACY — or "unknown"
+        when the call could not be made, in which case error says why. Never raises:
+        the runtime role may not hold bedrock:GetFoundationModel, and a gateway must
+        not refuse to start because it could not look up a label.
+
+        Lifecycle state is per region, so this reports it for whichever region the
+        client resolved to.
+        """
+        try:
+            client = await self._get_control_client()
+            resp = await client.get_foundation_model(modelIdentifier=model_id)
+            details = resp.get("modelDetails", {}) or {}
+            lifecycle = details.get("modelLifecycle", {}) or {}
+            return lifecycle.get("status") or "unknown", None
+        except Exception as exc:
+            return "unknown", f"{type(exc).__name__}: {exc}"
 
     async def _get_client(self):
         if self._client is not None:
@@ -417,15 +463,20 @@ class BedrockBackend:
         if self._stack is not None:
             await self._stack.aclose()
             self._stack = None
-        self._client = None
+        if not self._injected:
+            self._client = None
+        if not self._control_injected:
+            self._control_client = None
 
 
 def _bedrock_config():
     """botocore Config for the runtime client.
 
-    Retries are left at botocore's default rather than raised: a retried
-    converse_stream is a second billable generation, so the gateway should surface
-    the failure instead of quietly paying twice.
+    botocore's standard mode, which is three attempts. That does not risk paying
+    twice for one request: it retries throttles and connection or 5xx failures that
+    happen before a response begins, and once converse_stream has started returning
+    events a failure mid-stream is surfaced rather than retried. So a retry means the
+    first attempt generated nothing to bill for.
     """
     from botocore.config import Config
 

@@ -14,6 +14,24 @@ not measured is not listed here.
 
 ---
 
+## Metric definitions
+
+**`llm_tokens_generated_total` and `llm_tokens_per_second` count the backend's reported
+completion tokens, falling back to the streamed delta count when a backend reports no
+usage** (changed 2026-11-15). Previously both counted deltas. On Ollama one delta is one
+token, so the two are identical and **every figure in this file taken against Ollama is
+unaffected** — verified against a running server: for one 60-token request the metric
+delta, the reported `usage.completion_tokens` and the content-chunk count were all 60.
+The distinction starts to matter on Bedrock, where one Converse `contentBlockDelta` can
+carry several tokens: counting deltas would understate throughput on the dashboards while
+the cost table, which reads `usage`, stayed right. A cancelled request still falls back to
+the delta count, because its final chunk never arrives.
+
+The `request_completed` log line now carries both: `tokens` (billed) and `tokens_sent`
+(what the client received).
+
+---
+
 ## Bedrock backend: model availability, and what is not measured (2026-11-15)
 
 The `BedrockBackend` is implemented and unit-tested. **No Bedrock call has been made
@@ -50,13 +68,43 @@ Bedrock's own "Models at a glance" index still links Llama 3.2 1B and 3B; the in
 includes legacy and EOL cards, so it is not an availability signal. The per-model card is.
 
 **Consequence: the smallest Llama available on Bedrock is 8B, against `llama3.2:1b`
-locally — an 8× parameter difference. Any local-vs-Bedrock comparison using these is a
-comparison of *different models*, and must be labelled that way wherever it appears.**
-See `NOTES.md` for the cheaper alternative (pull `llama3.1:8b` locally instead), which
-would restore a controlled comparison and has not been done.
+locally — an 8× parameter difference.** Resolved by adding a local 8B cell rather than by
+moving the baseline: `llama3.2:1b` stays the series baseline, and `llama3.1:8b` runs
+locally as a second cell so the same weights can be compared local-vs-Bedrock. The tier
+mapping for the rest of this stage is:
 
-Both candidate models are in **Legacy** lifecycle with EOL 2027-03-30. A cost table built
-on them has roughly four months of shelf life.
+| Tier | Backend | Model | Role |
+|------|---------|-------|------|
+| `fast` | ollama | `llama3.2:1b` | series baseline, unchanged from Part 1 |
+| `balanced` | ollama | `llama3.1:8b` | local half of the controlled comparison |
+| `powerful` | bedrock | an Active model, chosen at run time (below) | paid tier |
+
+`balanced` vs `powerful` is only a controlled comparison when `powerful` is the same 8B
+weights on Bedrock. Against a 70B it is not, and is labelled as different models.
+
+Both Llama 3.x candidates are in **Legacy** lifecycle with EOL 2027-03-30, so a cost table
+built on them has about four months of shelf life. At least one row needs a model that
+survives that date. `meta.llama3-1-8b-instruct-v1:0` is kept as a configured model for the
+like-for-like cell rather than as a tier default; whether Llama 3.3 70B is Active or
+Legacy **in the configured region** is checked at run time by the startup lifecycle check
+below, and is **untested** here because that check needs credentials.
+
+### Lifecycle check at startup
+
+The gateway now reports each Bedrock tier's lifecycle status when it starts, because
+nothing warned that the model this stack was built around was being retired — calls
+simply begin failing with `ResourceNotFoundException`. For every tier whose kind is
+`bedrock` it calls the control-plane `GetFoundationModel` (not an inference call, does not
+bill) in the region the tier resolves to, and logs one line per tier:
+
+- `bedrock_model_lifecycle` with `tier`, `model`, `lifecycle`, `region` when ACTIVE
+- `bedrock_model_legacy` as a **warning** when LEGACY, naming the EOL consequence
+- `bedrock_lifecycle_unknown` as a warning when the call failed, with the error
+
+It never blocks startup: the runtime role may not hold `bedrock:GetFoundationModel`, and a
+missing label is not a reason to refuse to serve. Unit-tested with an injected client;
+**untested against the live API.** Lifecycle state is per region, so the report is for
+whichever region the tier resolved to.
 
 **Configuration detail that will bite:** Llama 3.1 8B is not available *in-region* in
 `us-east-1` — only `us-west-2` is. Elsewhere the geo inference id is required:
@@ -79,6 +127,12 @@ Using the bare id in the wrong region fails rather than silently routing.
 2026-11-15; its Meta section lists Llama 3.2 and 3.3 in the headings but renders token
 prices only for Llama 2, so no per-1k-token figure for the models above could be read
 off it. Rather than copy a price from a third-party aggregator, this row stays untested.
+The page is JS-rendered, so reading it needs a browser with the Meta tab selected.
+
+**Convention for when they are recorded:** every cost row carries the date its price was
+read and the URL it was read from, alongside the usual trial count, concurrency, model,
+backend and run directory. A price without a read-date is not usable six weeks later —
+these two Llama models are already Legacy, and prices move independently of lifecycle.
 
 **Cancellation cost is the row that decides a design question.** Stage 1 measured that a
 disconnected client on Ollama wastes 1–3% of generated tokens, and that the cleanup path
@@ -117,6 +171,53 @@ metered. Not "$0".
 The same run exercised cells (a) and (b), which declined cleanly: (a) reported "no AWS
 credentials resolved from the standard chain", (b) was not given a model id and refused
 rather than assuming one. Those refusals are in the run directory's `report.txt`.
+
+### Local 8B: does it fit, and what does it cost in latency
+
+The local half of the controlled comparison. Run before anything else, to establish
+whether an 8B is usable on this machine at all.
+
+**Conditions**
+
+| | |
+|---|---|
+| Date | 2026-11-15, 22:15 MST |
+| Hardware | Apple M5 Pro (`Mac17,9`), arm64, 24 GiB |
+| Ollama | 0.32.5, `library=Metal`, `OLLAMA_NUM_PARALLEL:4` |
+| Models | `llama3.2:1b`; `llama3.1:8b` (Q4_K_M, 6.87 GB resident) |
+| Gateway | compose image at `2be1df5` + the three review fixes, 4 queue slots |
+| Load | streaming, n=10, c=1, `max_tokens=120`, same 10 prompts as the cell above |
+| Run dir | `benchmark/out/run-local-8b-20261115-221501/` (`conditions.txt` holds the raw memory and offload lines) |
+
+| cell | backend | model | n | TTFT p50 | e2e p50 | tokens p50 | usage reported |
+|------|---------|-------|---|----------|---------|------------|----------------|
+| local | ollama | `llama3.2:1b` | 10 | 0.204 s | 0.678 s | 53 | yes |
+| local | ollama | `llama3.1:8b` | 10 | **0.314 s** | **1.899 s** | 48 | yes |
+
+Reported usage over 10 requests: 1B — 346 prompt, 596 completion. 8B — 196 prompt, 700
+completion. Marginal cost locally for either: **not measured**, the laptop is not metered.
+
+**It fits, on the GPU, and the machine swaps for it.** All three are results:
+
+- `library=Metal` and `offloaded 33/33 layers to GPU` — full offload, no CPU fallback.
+  6.87 GB resident in VRAM against 17.3 GiB available, so VRAM is not the constraint.
+- **System memory is.** Swap used went from 17.10 GB to 17.71 GB across the run and the
+  swap file itself grew 17.4 → 18.4 GB; free memory fell from 30% to 20%. The machine was
+  already swapping ~12.8 GB before the 8B was pulled, so this is added pressure on a
+  machine that had none to spare, not a clean baseline.
+- The 8B is **2.8× the end-to-end latency of the 1B** (1.899 s vs 0.678 s) and 1.5× the
+  TTFT, at a slightly *lower* token count. Treat these as an upper bound on what this
+  machine does with an 8B rather than as the model's latency: a host under memory
+  pressure is not a quiet host, and run-to-run spread has not been characterised at n=10.
+
+The 1B cell reproduces the 21:00 run (0.204/0.678 against 0.202/0.663) on a gateway build
+that includes the token-accounting change, which is the independent check that the change
+did not move Ollama's numbers.
+
+**Prompt tokens differ between the two local models for identical prompts** — 346 vs 196
+for the same ten strings. Different chat templates and tokenizers across llama3.1 and
+llama3.2, not a measurement error. It matters for any per-token cost comparison: the same
+prompt set is not the same number of billable input tokens on different models.
 
 ---
 

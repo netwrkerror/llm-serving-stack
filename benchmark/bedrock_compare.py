@@ -214,7 +214,7 @@ def fmt_report(args, cells: list[Cell]) -> str:
     w(f"region: {args.region or '(from credential chain)'}")
     w("")
 
-    hdr = (f'{"cell":<17}{"backend":<10}{"model":<34}{"n":>4}{"ttft_p50_s":>12}'
+    hdr = (f'{"cell":<20}{"backend":<10}{"model":<34}{"n":>4}{"ttft_p50_s":>12}'
            f'{"e2e_p50_s":>11}{"tok_p50":>9}{"usage":>8}')
     w(hdr)
     w("-" * len(hdr))
@@ -222,7 +222,7 @@ def fmt_report(args, cells: list[Cell]) -> str:
         return f"{'-':>{width}}" if value is None else f"{value:{width}.{places}f}"
 
     for cell in cells:
-        prefix = f"{cell.name:<17}{cell.backend:<10}{cell.model[:33]:<34}"
+        prefix = f"{cell.name:<20}{cell.backend:<10}{cell.model[:33]:<34}"
         if cell.unavailable:
             w(f"{prefix}{'-':>4}{'not run':>12}{'-':>11}{'-':>9}{'-':>8}")
             continue
@@ -253,7 +253,7 @@ def fmt_report(args, cells: list[Cell]) -> str:
             continue
         pt = sum(s.prompt_tokens for s in ok)
         ct = sum(s.completion_tokens for s in ok)
-        w(f"  {cell.name:<17} prompt={pt:<7} completion={ct:<7} "
+        w(f"  {cell.name:<20} prompt={pt:<7} completion={ct:<7} "
           f"requests={len(ok)}  {'(reported)' if all(s.usage_reported for s in ok) else '(INCOMPLETE — do not cost this)'}")
     w("")
 
@@ -274,7 +274,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cells", default="a,b,c",
                    help="comma-separated: a=bedrock-direct b=bedrock-gateway c=local-gateway")
     p.add_argument("--gateway", default=DEFAULT_GATEWAY)
-    p.add_argument("--local-model", default=DEFAULT_LOCAL_MODEL)
+    p.add_argument("--local-model", default=DEFAULT_LOCAL_MODEL,
+                   help="comma-separated for several local cells, e.g. "
+                        "llama3.2:1b,llama3.1:8b — one cell each")
     p.add_argument("--bedrock-model", default="",
                    help="exact Bedrock model id; required for cells a and b")
     p.add_argument("--region", default=os.environ.get("AWS_REGION", ""))
@@ -282,8 +284,77 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def check_no_credentials_in_repo() -> list[str]:
+    """Refuse to run if AWS credentials look like they are in the repo.
+
+    Credentials belong in the shell that launches compose (AWS_PROFILE=...), never in
+    .env or a tracked file. Checks the places they get pasted into.
+
+    Two things are deliberately not flagged, because flagging them would train you to
+    ignore this: a variable passed through from the environment (AWS_REGION:
+    "${AWS_REGION}") is correct usage, not a leak, and so is a name with no value. Key
+    material (AKIA.../ASIA..., aws_secret_access_key) is always flagged. This file is
+    skipped, since it necessarily contains the words it searches for.
+    """
+    import re
+    import subprocess
+
+    findings: list[str] = []
+    # Key material: always a leak.
+    secret_re = re.compile(r"(AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}"
+                           r"|aws_(?:access_key_id|secret_access_key|session_token)\s*=\s*\S)",
+                           re.IGNORECASE)
+    # An AWS_* setting with a literal value baked in.
+    assign_re = re.compile(r"\b(AWS_[A-Z0-9_]+)\s*[=:]\s*(.*)$")
+    root = Path(__file__).resolve().parent.parent
+    myself = Path(__file__).resolve()
+
+    candidates = [root / ".env", root / "docker-compose.yml"]
+    try:
+        tracked = subprocess.run(["git", "-C", str(root), "ls-files"],
+                                 capture_output=True, text=True, timeout=30)
+        candidates += [root / line for line in tracked.stdout.split("\n") if line.strip()]
+    except Exception:
+        findings.append("could not list tracked files; checked .env and compose only")
+
+    for path in candidates:
+        try:
+            if not path.is_file() or path.resolve() == myself:
+                continue
+            text = path.read_text(errors="replace")
+        except Exception:
+            continue
+        for lineno, line in enumerate(text.split("\n"), 1):
+            if line.strip().startswith("#"):
+                continue  # a commented example is documentation
+            hit = secret_re.search(line)
+            if hit:
+                findings.append(f"{path.relative_to(root)}:{lineno}: {hit.group(1)[:24]}")
+                continue
+            match = assign_re.search(line)
+            if not match:
+                continue
+            value = match.group(2).strip().strip('\'"').strip()
+            # Empty, or an environment passthrough / placeholder: not a literal secret.
+            if not value or value.startswith("${") or value.startswith("<"):
+                continue
+            findings.append(f"{path.relative_to(root)}:{lineno}: {match.group(1)} has a literal value")
+    return findings
+
+
 async def main() -> int:
     args = parse_args()
+
+    leaks = check_no_credentials_in_repo()
+    if leaks:
+        print("ABORT: AWS credentials or AWS_* settings found in repository files.",
+              file=sys.stderr)
+        print("Credentials belong in the launching shell (AWS_PROFILE=...), not in the repo.",
+              file=sys.stderr)
+        for leak in leaks:
+            print(f"  {leak}", file=sys.stderr)
+        return 2
+
     wanted = {c.strip() for c in args.cells.split(",") if c.strip()}
 
     cells: list[Cell] = []
@@ -292,14 +363,22 @@ async def main() -> int:
     if "b" in wanted:
         cells.append(Cell("bedrock-gateway", args.bedrock_model, "bedrock"))
     if "c" in wanted:
-        cells.append(Cell("local-gateway", args.local_model, "ollama"))
+        local_models = [m.strip() for m in args.local_model.split(",") if m.strip()]
+        for model in local_models:
+            # One cell per local model. The balanced-vs-powerful pair (llama3.1:8b
+            # local vs the same weights on Bedrock) is the controlled comparison;
+            # llama3.2:1b stays as the series baseline.
+            name = "local-gateway" if len(local_models) == 1 else f"local:{model}"
+            cells.append(Cell(name, model, "ollama"))
 
     for cell in cells:
         if cell.backend == "bedrock" and not args.bedrock_model:
             cell.unavailable = "--bedrock-model not given; no model id is assumed"
             continue
         print(f"running {cell.name} ({cell.model}) ...", flush=True)
-        if cell.name == "bedrock-direct":
+        if cell.backend == "ollama":
+            await run_gateway(cell, args.gateway, args.max_tokens, args.requests)
+        elif cell.name == "bedrock-direct":
             await run_bedrock_direct(cell, args.region, args.max_tokens, args.requests)
         elif cell.name == "bedrock-gateway":
             # Names the backend explicitly so the tier heuristic cannot send this
@@ -307,8 +386,6 @@ async def main() -> int:
             cell.model = f"bedrock:{args.bedrock_model}"
             await run_gateway(cell, args.gateway, args.max_tokens, args.requests)
             cell.model = args.bedrock_model
-        else:
-            await run_gateway(cell, args.gateway, args.max_tokens, args.requests)
 
     report = fmt_report(args, cells)
     print()
@@ -324,7 +401,7 @@ async def main() -> int:
                 "concurrency": 1,
                 "max_tokens": args.max_tokens,
                 "region": args.region,
-                "local_model": args.local_model,
+                "local_models": [m.strip() for m in args.local_model.split(",") if m.strip()],
                 "bedrock_model": args.bedrock_model,
                 "prompts": PROMPTS,
                 "wall_clock": time.strftime("%Y-%m-%dT%H:%M:%S%z"),

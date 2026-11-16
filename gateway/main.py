@@ -61,6 +61,45 @@ def backend_for(kind: str) -> Backend:
         )
 
 
+async def _log_bedrock_lifecycles() -> None:
+    """Report each Bedrock tier's model lifecycle status at startup.
+
+    This exists because the model this stack was first built around — Llama 3.2 1B —
+    reached end of life on Bedrock while the work was in progress, and nothing in the
+    gateway would have said so: calls simply start failing with ResourceNotFoundException.
+    A LEGACY warning at startup is the warning you want months before that.
+
+    GetFoundationModel is a control-plane call, not inference, so it does not bill.
+    It never blocks startup: the runtime role may not hold bedrock:GetFoundationModel,
+    and a missing label is not a reason to refuse to serve.
+    """
+    tiers = {t: cfg for t, cfg in settings.tiers.items() if cfg.kind == "bedrock"}
+    if not tiers:
+        return
+    impl = _backends.get("bedrock")
+    if impl is None or not hasattr(impl, "model_lifecycle"):
+        return
+
+    for tier, cfg in tiers.items():
+        status, error = await impl.model_lifecycle(cfg.model)
+        extra = {
+            "tier": tier,
+            "model": cfg.model,
+            "lifecycle": status,
+            "region": settings.aws_region or "(credential chain)",
+        }
+        if error:
+            log.warning("bedrock_lifecycle_unknown", extra={**extra, "error": error})
+        elif status.upper() == "LEGACY":
+            log.warning("bedrock_model_legacy", extra={
+                **extra,
+                "note": "model is in its legacy period and will reach end of life; "
+                        "calls start failing with ResourceNotFoundException at EOL",
+            })
+        else:
+            log.info("bedrock_model_lifecycle", extra=extra)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_tracing()
@@ -88,6 +127,8 @@ async def lifespan(app: FastAPI):
         log.info("all_tiers_local", extra={
             "tiers": {t: str(cfg) for t, cfg in settings.tiers.items()},
         })
+
+    await _log_bedrock_lifecycles()
 
     yield
 
@@ -269,6 +310,25 @@ def _record_backend_timings(span, timings: dict) -> None:
         span.set_attribute("ollama.unattributed_ms", round(timings["total_ms"] - phases, 2))
 
 
+def _completion_tokens(meta: dict, delta_count: int) -> int:
+    """Generated tokens for the token and throughput metrics.
+
+    The backend's own count when it reports one, the streamed delta count otherwise.
+    These are not the same thing: for Ollama one delta is one token, so the two agree,
+    but a Converse `contentBlockDelta` can carry several tokens at once. Counting
+    deltas there would understate Bedrock throughput on the dashboards while the cost
+    table — which reads `usage` — was right, and the two would quietly disagree.
+
+    The fallback matters for more than safety: a cancelled request never receives the
+    final chunk, so usage never arrives and the delta count is all there is.
+    """
+    usage = meta.get("usage") or {}
+    reported = usage.get("completion_tokens")
+    if isinstance(reported, int) and reported >= 0:
+        return reported
+    return delta_count
+
+
 class _UpstreamFailure(Exception):
     """A backend failure that happened before any bytes were sent to the client,
     so it can still be reported as a real HTTP status."""
@@ -408,16 +468,20 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
                                 duration = time.perf_counter() - gen_start
                                 e2e = time.perf_counter() - arrival
                                 _record_backend_timings(inf_span, meta.get("timings", {}))
+                                billed = _completion_tokens(meta, token_count)
                                 REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
                                 REQUEST_DURATION.labels(model=model, stream="true", status="success").observe(e2e)
-                                TOKENS_GENERATED.labels(model=model).inc(token_count)
-                                THROUGHPUT.labels(model=model).observe(token_count / duration if duration > 0 else 0)
+                                TOKENS_GENERATED.labels(model=model).inc(billed)
+                                THROUGHPUT.labels(model=model).observe(billed / duration if duration > 0 else 0)
                                 log.info("request_completed", extra={
                                     "model": model, "stream": True,
                                     "duration_s": round(e2e, 3),
                                     "generation_s": round(duration, 3),
-                                    "tokens": token_count,
-                                    "tps": round(token_count / duration if duration > 0 else 0, 1),
+                                    "tokens": billed,
+                                    # What the client actually received, which is a delta
+                                    # count and so not always the token count.
+                                    "tokens_sent": sent_tokens,
+                                    "tps": round(billed / duration if duration > 0 else 0, 1),
                                 })
                                 final = {
                                     "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
