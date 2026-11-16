@@ -283,7 +283,8 @@ All three signals, correlated: a log line carries the `trace_id` of its trace.
 | `llm_request_duration_seconds` | End-to-end, arrival to last byte, including queue wait. Labelled by `status` so failures are separable |
 | `llm_time_to_first_token_seconds` | Arrival to first streamed token, **including queue wait** |
 | `llm_tokens_per_second` | Generation throughput, excluding queue wait |
-| `llm_tokens_generated_total` | Cumulative token count |
+| `llm_tokens_generated_total` | Cumulative token count. Excludes cancelled requests — the count comes from a final chunk a disconnected client never gets |
+| `llm_requests_cancelled_total` | Streaming requests whose client hung up mid-stream. Separate from `llm_requests_total` so success/error ratios there keep their meaning |
 
 ### Trace spans
 
@@ -295,7 +296,8 @@ and, on the Ollama backend, the backend's own phase timings:
 |-----------|---------|
 | `ollama.total_ms` | What Ollama reports for the whole call — **includes its own queue wait** |
 | `ollama.load_ms` / `prompt_eval_ms` / `eval_ms` | Per-phase breakdown |
-| `ollama.unattributed_ms` | `total` minus those phases. Tracks backend contention: ~1 ms for an uncontended request, ~400 ms for the last of four when `OLLAMA_NUM_PARALLEL=1` |
+| `ollama.unattributed_ms` | `total` minus those phases. Tracks backend contention — it grows when requests wait on each other inside Ollama. Measured values, with the scenario behind each, are in [benchmark/RESULTS.md](benchmark/RESULTS.md) |
+| `llm.outcome` | On `llm.request` and `llm.inference`: `completed`, `error`, or `cancelled` (client hung up mid-stream) |
 
 ---
 

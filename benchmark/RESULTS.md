@@ -14,6 +14,136 @@ not measured is not listed here.
 
 ---
 
+## Client disconnect: what happens upstream (2026-11-15)
+
+The hypothesis under test was that when a streaming client hangs up, the gateway releases
+its semaphore slot but never closes the backend generator, so the httpx stream to Ollama
+stays open and **Ollama keeps generating**.
+
+**That is wrong in the common case.** In 89 of 90 measured disconnects Ollama cancelled
+the task 30–50 ms (median) after the client went away, wasting 1–3% of the tokens it had
+generated. The upstream was being closed all along — by async-generator finalization
+rather than by anything the gateway did deliberately.
+
+What *was* broken is that a disconnect left no trace anywhere: no counter, no duration,
+no span outcome. 60 cancelled requests produced no streaming row in `llm_requests_total`
+at all.
+
+**Conditions**
+
+| | |
+|---|---|
+| Date | 2026-11-15, 17:19–17:37 MST |
+| Hardware | Apple M5 Pro (`Mac17,9`), arm64 |
+| Ollama | 0.32.5, llama.cpp / GGML **Metal** (`library=Metal`, verified per run from the server log) |
+| Model | `llama3.2:1b`, warmed directly and through the gateway before each run |
+| Gateway | compose, 4 queue slots, `GATEWAY_BACKEND=ollama` (`/api/chat`) |
+| Setting verified | `OLLAMA_NUM_PARALLEL:4` read back from the server's own log |
+| Load | `benchmark/disconnect.py`: streaming, `max_tokens=400`, client reads for 1.0 s then drops the socket |
+| Trials | n=10 per cell. c=1: one cell per arm. c=4: 5 cells before, 4 cells after |
+| Run dirs | `benchmark/out/run-disconnect-before-metal-20261115-171955/`, `run-disconnect-before-metal-reps-20261115-173451/`, `run-disconnect-after-metal-20261115-172242/`, `run-disconnect-after-metal-reps-20261115-173207/` |
+
+"before" is the code at `6360a39`; "after" adds `agen.aclose()` in `event_stream`'s
+`finally`, the `llm_requests_cancelled_total` counter, and an `llm.outcome` span
+attribute. Token counts come from Ollama's own log: `eval_count` where the task completed
+normally, total context minus prompt where it was cancelled (llama.cpp prints no timing
+block for a cancelled task). Request-to-task matching is by unique prompt length — see
+the header of `benchmark/disconnect.py`.
+
+### Tokens generated after the client left
+
+| arm | c | requests | tokens to client | tokens generated | after close | wasted | cancelled |
+|-----|---|----------|------------------|------------------|-------------|--------|-----------|
+| before | 1 | 10 | 1182 | 1220 | 38 | 3.1% | 10/10 |
+| before | 4 | 50 | 3895 | 3957 | 62 | 1.6% | 50/50 |
+| after | 1 | 10 | 1191 | 1202 | 11 | 0.9% | 10/10 |
+| after | 4 | 40 | 3154 | 3490 | 336 | 9.6% | 39/40 |
+
+The `after` c=4 row is dominated by a single request; excluding it, that arm is 37 wasted
+tokens over 39 requests (**1.2%**) — the same as `before` within run-to-run spread. The
+fix does not reduce wasted tokens, because there were almost none to reduce.
+
+### The one that got away
+
+In `run-disconnect-after-metal-20261115-172242/c4`, request 8 (Ollama task 1431):
+
+| | |
+|---|---|
+| tokens the client received | 101 |
+| tokens Ollama generated | **400** — its full `max_tokens` |
+| source | `eval_count`, i.e. llama.cpp printed a normal completion timing block |
+| `cancel task` in the log | **absent** |
+| client close → Ollama done | 2.738 s |
+
+This is precisely the behaviour the hypothesis predicted, and it happened *with* the fix
+in place. It is 1 occurrence in 90 disconnects: 0 of 50 in `before` at c=4, 1 of 40 in
+`after`. With one event the arms cannot be separated, so **this is not attributable to
+the fix** — and it is not evidence the fix caused it. What it does show is that cleanup is
+not guaranteed in either arm.
+
+The reason is structural. `agen.aclose()` lives in `event_stream`'s `finally`, and
+reaching that `finally` depends on the same async-generator finalization that was already
+closing the upstream. When finalization is late, the explicit close is late too. Making
+cancellation deterministic requires detecting the disconnect somewhere that is not inside
+the generator being cleaned up — an `http.disconnect` listener, or a pump task owned by
+the request. **Untested; not implemented.**
+
+### What the fix actually changed: disconnects became visible
+
+| | before | after |
+|---|--------|-------|
+| disconnects measured | 60 | 40 |
+| rows in `llm_requests_total` | **none** — no `stream="true"` series exists | unchanged by design |
+| `llm_requests_cancelled_total` | metric did not exist | **20 of 20** in the main run |
+| `llm_tokens_generated_total` | 8 — the warm-up's only | unchanged |
+| `llm.outcome` on `llm.request` | absent | `cancelled` / `completed` / `error` |
+
+Before the fix a cancelled request incremented nothing: the `done` branch never runs, and
+the `except Exception` branch does not catch the unwinding. 60 disconnects that cost real
+GPU time were invisible on every dashboard. `llm_requests_cancelled_total` is deliberately
+separate from `llm_requests_total` rather than a third `status` value, so existing
+success/error ratios keep their meaning.
+
+The tokens Ollama generated for a cancelled request are still **not** counted in
+`llm_tokens_generated_total` — the gateway only learns the count from the final chunk,
+which by definition never arrives. Known gap, untested as to whether the log-derived count
+could be recovered another way.
+
+### Timing
+
+| arm | c | close → `cancel task`, median | max |
+|-----|---|-------------------------------|-----|
+| before | 1 | 0.031 s | 0.319 s |
+| before | 4 | 0.030 s | 0.053 s |
+| after | 1 | 0.030 s | 0.056 s |
+| after | 4 | 0.034 s | 0.049 s |
+
+Unchanged by the fix, as expected: the close happens at finalization either way.
+
+### The slot is released promptly
+
+`llm_active_requests` returns to 0 within one 1 s query step of its last non-zero sample
+in every cell, before and after — comfortably inside the 5 s scrape interval, and it never
+stays elevated. Peak matches the concurrency (1 and 4).
+`llm_queue_waiting_requests` stayed at 0 throughout: with 4 slots and c≤4 nothing ever
+queued at the gateway. **The semaphore release was never the problem.**
+
+### Two CPU-only runs, kept but not comparable
+
+`run-disconnect-before-20261115-163332/` and `run-disconnect-after-20261115-171317/` were
+taken before the Metal check existed and are **invalid for comparison with anything else
+in this file**. Both were launched through `/usr/local/bin/timeout`, an x86_64 binary, so
+the whole process tree ran under Rosetta; Rosetta started the x86_64 half of Ollama's
+universal binary, which has no Metal support, and the server logged
+`inference compute id=cpu library=cpu`. Throughput was ~33 tok/s against ~120–140 tok/s on
+Metal. They are retained because runs are not destroyed, and because the before/after
+comparison *within* that pair is internally consistent. `run_disconnect.sh` now aborts if
+`uname -m` disagrees with `hw.optional.arm64`, or if Ollama reports `library=cpu`.
+`run-disconnect-smoke-20261115-163121/` is a QUICK-mode harness smoke test at n=3, also
+CPU-only, also not data.
+
+---
+
 ## Backend concurrency under load (2026-11-15)
 
 The run the write-up cites. Supersedes the 2026-11-14 sweep below, which measured the
