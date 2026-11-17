@@ -17,6 +17,8 @@ _GUARDED = (
     "tier_balanced",
     "tier_powerful",
     "aws_region",
+    "ollama_url",
+    "openai_url",
 )
 
 

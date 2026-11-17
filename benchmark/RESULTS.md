@@ -14,6 +14,101 @@ not measured is not listed here.
 
 ---
 
+## Policy routing and fallback (2026-11-16)
+
+Fallback measured with two local Ollama servers, so this is the **mechanism** — does
+fallback fire, and does it fire only before the first byte — not the latency cost of
+failing over to a remote provider. That column is **untested, Bedrock**.
+
+**Conditions**
+
+| | |
+|---|---|
+| Date | 2026-11-16, 17:33 MST |
+| Hardware | Apple M5 Pro (`Mac17,9`), arm64 |
+| Ollama | 0.32.5, `library=Metal` verified in both servers' logs, `OLLAMA_NUM_PARALLEL:4` each |
+| Backends | primary `ollama` @ 127.0.0.1:11434, secondary `openai` @ 127.0.0.1:11435/v1 (Ollama's own `/v1`) |
+| Tier | `fast` = `ollama:llama3.2:1b,openai:llama3.2:1b` |
+| Load | streaming, n=24, c=4, `max_tokens=400`, 2 repeats |
+| Kill | `SIGTERM` to the process listening on 11434, 4 s into each run |
+| Run dirs | `benchmark/out/run-fallback-20261116-173336/` (the measurement), `benchmark/out/run-fallback-20261116-172519/` (the 10 s kill, see below) |
+
+### The specified 10 s kill measures nothing on this machine
+
+The first run used the stage's 10 s and reported **zero fallbacks in both repeats** —
+not because fallback is broken, but because the scenario was already over. At
+`max_tokens=400` these prompts still finish in ~1.4 s p50 (the model stops well short of
+the cap), so n=24 at c=4 is a **10.2 s** run. The kill landed at +10.17 s against a
+10.18 s wall: after the last request had been served. That run is kept as
+`run-fallback-20261116-172519/` because a reader could easily repeat the mistake and
+conclude the mechanism does not work. The kill was moved to 4 s, which is mid-run.
+
+### Fallback under load, kill at 4 s
+
+| | repeat 1 | repeat 2 |
+|---|---|---|
+| wall | 7.17 s | 8.96 s |
+| kill landed | +4.16 s | +4.13 s |
+| requests | 24 | 24 |
+| served by primary | 12 | 10 |
+| **fell back** (to `openai`) | **8** | **12** |
+| failed | 4 | 2 |
+| p50 e2e, normal | 0.953 s | 1.364 s |
+| p50 e2e, fell back | **1.474 s** | **1.550 s** |
+| p50 TTFT, normal | 0.239 s | 0.232 s |
+| p50 TTFT, fell back | 0.304 s | 0.239 s |
+
+Falling back cost **+0.52 s** and **+0.19 s** on p50 end-to-end across the two repeats —
+one refused connection plus a second backend's prefill, on the same machine. The spread
+between repeats is larger than the effect, so read this as "roughly a prefill's worth",
+not as a figure to quote to three decimals.
+
+`llm_fallbacks_total{tier="fast",from_kind="ollama",to_kind="openai",reason="upstream_unavailable"}`
+= **20**, exactly 8 + 12. Every fallback had the same reason: the killed server refuses
+connections, which `_classify_upstream` maps to `upstream_unavailable`.
+
+### Zero fallbacks after the first byte
+
+The 6 failures across both repeats are the post-first-byte case, and they are the
+evidence for this rather than a separate experiment:
+
+- All 6 had **HTTP 200 and a recorded TTFT** (0.19–0.34 s) before failing — they were
+  already streaming when the primary died.
+- All 6 ended as **in-band error chunks**: `peer closed connection without sending
+  complete message body (incomplete chunked read)`.
+- **None of them fell back.** `llm_fallbacks_total` moved by exactly the number of
+  requests that had no TTFT yet.
+- Conversely, "fallen-back requests with no first token: none" in both repeats — no
+  fallen-back request promised bytes it then failed to deliver.
+
+That is the designed behaviour: once the 200 and the SSE content-type are committed a
+failure can only be reported in band, so there is nothing to retry into. The guarantee is
+structural as well as measured — the only two call sites that can fall back are
+`_open_first_chunk` and `_generate_with_fallback`, both of which run before any yield to
+the client.
+
+### Fallback is not attempted when the request itself is wrong
+
+A 4xx meaning the request is malformed is not retried: an unknown model id is unknown at
+the next backend too, and an over-long prompt is over-long there too, so retrying buys
+the same error at a second backend's price. `_NO_FALLBACK_STATUSES` is 400, 404, 413 and
+422. Everything else — connection failures, timeouts, 5xx, throttling, and auth errors
+that may simply be this backend's credentials — is worth another backend's attempt.
+Unit-tested in both directions (404 and 422 do not fall back, 429 and connect errors do);
+**the only one observed in a live run is `upstream_unavailable`.**
+
+### What is not measured
+
+| | |
+|---|---|
+| Latency cost of falling back to a **remote** backend | **untested, Bedrock** |
+| Cost of a fallback that reaches a paid backend | **untested, Bedrock** |
+| Fallback across a real network partition (both servers are on one host here) | untested |
+| Fallback when the primary is slow rather than dead — there is no timeout-triggered case | untested |
+| Policy routing under load (the policy tests are unit-level; no load run exercises `local_only`) | untested |
+
+---
+
 ## Metric definitions
 
 **`llm_tokens_generated_total` and `llm_tokens_per_second` count the backend's reported

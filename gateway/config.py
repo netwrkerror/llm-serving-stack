@@ -9,6 +9,13 @@ TIERS = ("fast", "balanced", "powerful")
 KINDS = ("ollama", "openai", "bedrock")
 LOCAL_KINDS = ("ollama", "openai")
 
+# Per-key routing policies. "auto" routes by prompt content; "local_only" allows
+# routing but never to a backend outside LOCAL_KINDS; a tier name pins every request
+# from that key to that tier.
+POLICY_AUTO = "auto"
+POLICY_LOCAL_ONLY = "local_only"
+POLICIES = (POLICY_AUTO, POLICY_LOCAL_ONLY) + TIERS
+
 
 class TierConfig(NamedTuple):
     """Where one tier's requests go."""
@@ -51,6 +58,12 @@ class Settings(BaseSettings):
     backend_url: str = "http://localhost:11434"
     backend_api_key: str = ""
 
+    # Per-kind URLs, each falling back to backend_url. Needed once a tier can name a
+    # fallback chain spanning two kinds — "ollama:…,openai:…" is two different servers,
+    # so one backend_url cannot address both. Part 1's single-URL setup is unchanged.
+    ollama_url: str = ""
+    openai_url: str = ""
+
     # Fallback only: the model used for a tier that has not been configured.
     default_model: str = "llama3.2:1b"
     max_concurrent_requests: int = 4
@@ -80,7 +93,13 @@ class Settings(BaseSettings):
     bedrock_timeout: float = 120.0
 
     # Auth — disabled by default for local dev
-    # Set GATEWAY_API_KEYS="key1,key2" to enable
+    # Set GATEWAY_API_KEYS="key1,key2" to enable.
+    #
+    # A key may carry a routing policy after "=":
+    #   GATEWAY_API_KEYS="k1,k2=local_only,k3=fast"
+    # Policies are auto (the default), local_only, or a tier name. "=" rather than ":"
+    # because ":" already separates kind from model everywhere else. A key with no
+    # policy is auto, so Part 1's plain comma-separated list still works.
     auth_enabled: bool = False
     api_keys: str = ""
 
@@ -101,13 +120,59 @@ class Settings(BaseSettings):
 
     @property
     def api_key_set(self) -> set[str]:
-        return {k.strip() for k in self.api_keys.split(",") if k.strip()}
+        return set(self.key_policies)
 
-    def resolve_tier(self, tier: str) -> TierConfig:
-        """The backend kind and model serving one tier.
+    @property
+    def key_policies(self) -> dict[str, str]:
+        """key -> routing policy, for every configured key.
 
-        GATEWAY_TIER_<TIER> wins; failing that the GATEWAY_MODEL_<TIER> model on the
-        default kind; failing that default_model on the default kind.
+        An entry with no "=" is `auto`. An unrecognised policy is kept verbatim here
+        rather than silently corrected; `invalid_key_policies` reports it and startup
+        refuses, because quietly turning a misspelt `local_only` into `auto` would
+        hand a key the paid backends it was configured not to reach.
+        """
+        out: dict[str, str] = {}
+        for entry in self.api_keys.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            key, sep, policy = entry.partition("=")
+            key = key.strip()
+            if not key:
+                continue
+            out[key] = policy.strip() if sep else POLICY_AUTO
+        return out
+
+    @property
+    def invalid_key_policies(self) -> dict[str, str]:
+        """Configured policies that are not recognised. Empty when the config is sound."""
+        return {k: p for k, p in self.key_policies.items() if p not in POLICIES}
+
+    def policy_for(self, api_key: str) -> str:
+        """The routing policy for a key. Unknown or absent keys are `auto`.
+
+        Unknown keys reach here when auth is disabled, which is the shipped default:
+        there is no key to look up, so there is no policy to apply.
+        """
+        return self.key_policies.get(api_key, POLICY_AUTO)
+
+    def url_for(self, kind: str) -> str:
+        """The base URL for a kind, falling back to backend_url."""
+        if kind == "ollama":
+            return self.ollama_url or self.backend_url
+        if kind == "openai":
+            return self.openai_url or self.backend_url
+        return self.backend_url
+
+    def resolve_chain(self, tier: str) -> list[TierConfig]:
+        """The ordered backends serving one tier: the first is primary, the rest are
+        fallbacks tried only before any bytes reach the client.
+
+        GATEWAY_TIER_<TIER> wins and may be a comma-separated chain:
+            GATEWAY_TIER_FAST="ollama:llama3.2:1b,openai:llama3.2:1b"
+        Failing that, the GATEWAY_MODEL_<TIER> model on the default kind; failing that
+        default_model on the default kind. Both of those are single-entry chains, so a
+        configuration that predates fallback simply has nothing to fall back to.
         """
         spec = {
             "fast": self.tier_fast,
@@ -121,10 +186,23 @@ class Settings(BaseSettings):
         }[tier] or self.default_model
 
         if not spec.strip():
-            return TierConfig(self.backend, fallback_model)
+            return [TierConfig(self.backend, fallback_model)]
 
-        kind, model = parse_tier_spec(spec)
-        return TierConfig(kind or self.backend, model or fallback_model)
+        chain: list[TierConfig] = []
+        for part in spec.split(","):
+            if not part.strip():
+                continue
+            kind, model = parse_tier_spec(part)
+            chain.append(TierConfig(kind or self.backend, model or fallback_model))
+        return chain or [TierConfig(self.backend, fallback_model)]
+
+    def resolve_tier(self, tier: str) -> TierConfig:
+        """The primary backend and model serving one tier — the chain's first entry."""
+        return self.resolve_chain(tier)[0]
+
+    @property
+    def tier_chains(self) -> dict[str, list[TierConfig]]:
+        return {tier: self.resolve_chain(tier) for tier in TIERS}
 
     @property
     def tiers(self) -> dict[str, TierConfig]:
@@ -155,7 +233,7 @@ class Settings(BaseSettings):
         request gets a 503 naming the kinds that were built, rather than an AWS client
         being constructed on a machine that never intended to call AWS.
         """
-        kinds = {cfg.kind for cfg in self.tiers.values()}
+        kinds = {cfg.kind for chain in self.tier_chains.values() for cfg in chain}
         kinds.add(self.backend)
         if self.aws_region.strip():
             kinds.add("bedrock")
@@ -163,9 +241,15 @@ class Settings(BaseSettings):
 
     @property
     def remote_tiers(self) -> dict[str, TierConfig]:
-        """Tiers pointing at a non-local backend. Logged at startup so it is never a
-        surprise that automatic routing can spend money."""
-        return {t: cfg for t, cfg in self.tiers.items() if not cfg.is_local}
+        """Tiers with a non-local backend anywhere in their chain. Logged at startup so
+        it is never a surprise that automatic routing can spend money — a fallback entry
+        counts, since a primary failure is enough to reach it."""
+        out: dict[str, TierConfig] = {}
+        for tier, chain in self.tier_chains.items():
+            remote = next((cfg for cfg in chain if not cfg.is_local), None)
+            if remote is not None:
+                out[tier] = remote
+        return out
 
 
 settings = Settings()
