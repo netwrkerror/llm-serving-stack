@@ -572,3 +572,39 @@ anyway. The regex checks are hand-written and loose where the prompt does not de
 terseness; a model could pass `fact-05` by saying "time to first token" inside an
 otherwise wrong answer. And the graded rates are not comparable across categories, which
 is exactly why there is no blended number.
+
+## Stage 3 follow-up — observability for the decisions (2026-11-16)
+
+**A downgrade now has a counter, and the reason is the Stage 1 lesson applied early.**
+`llm_policy_downgrades_total{from_tier,to_tier}`. `X-Model-Tier` already reported the
+tier that *served* the request, which is right, but it means the tier that was *asked
+for* left no trace at all once the log line scrolled away — exactly the shape of the
+disconnect defect in Stage 1, where 60 cancelled requests produced no metric. Caught here
+by analogy rather than by measurement, which is the cheaper way to catch it.
+
+**Two legal settings that are dangerous together.** Auth off is the shipped default; a
+paid tier is a deliberate choice. Together they mean any caller who can reach the port
+can spend money — and because a routing policy attaches to an API key, there is no key
+and therefore no policy that can stop them. `remote_tiers_configured_without_auth` is now
+its own warning event rather than a sentence inside the existing one, so it can be
+alerted on. Tested in all four combinations.
+
+**The 401/403 fallback decision, written down because it could reasonably go either
+way.** A backend auth failure *does* fall back. Credentials are per backend, not per
+request: a 401 from Bedrock says this gateway's AWS credentials are wrong, and says
+nothing about whether the next backend — often with separate credentials, or none, for a
+local one — can serve the request. Not falling back would let one misconfigured backend
+take down a tier that has a working fallback behind it. The cost of being wrong this way
+is bounded and visible: a second failed attempt, and a
+`llm_fallbacks_total{reason="upstream_error"}` series that makes a chain-wide auth problem
+obvious. The cost of the other way is a tier that is down while a healthy backend sits
+unused. **Untested against a real 401** — no credentialed backend exists yet.
+
+**The fallback table's baseline moves between repeats and the reason is the test rig.**
+"normal" p50 is 0.953 s in repeat 1 and 1.364 s in repeat 2, with nothing in the request
+path changed. Both Ollama servers share one Metal device, so they contend for the same
+GPU, and the kill changes how much. Only the within-repeat normal-vs-fell-back comparison
+is valid; neither column is comparable across repeats, and 0.953 s is not this machine's
+uncontended baseline — the single-server figure for the same model is 0.678 s. Noted in
+`RESULTS.md` next to the table, because a reader would otherwise reasonably read those
+two numbers as a trend.
