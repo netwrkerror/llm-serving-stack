@@ -181,6 +181,15 @@ one refused connection plus a second backend's prefill, on the same machine. The
 between repeats is larger than the effect, so read this as "roughly a prefill's worth",
 not as a figure to quote to three decimals.
 
+**Only the within-repeat comparison is valid.** The "normal" p50 moves from 0.953 s in
+repeat 1 to 1.364 s in repeat 2 — a 43% shift in the baseline, with nothing about the
+request path changed. Both Ollama servers share one Metal device, so they contend for the
+same GPU, and how much depends on how many requests each is holding at the moment, which
+the kill changes. Compare normal against fell-back *inside* a repeat; do not compare
+either column across repeats, and do not treat 0.953 s as this machine's uncontended
+baseline — the single-server figure for the same model is 0.678 s p50 e2e (see the local
+8B section).
+
 `llm_fallbacks_total{tier="fast",from_kind="ollama",to_kind="openai",reason="upstream_unavailable"}`
 = **20**, exactly 8 + 12. Every fallback had the same reason: the killed server refuses
 connections, which `_classify_upstream` maps to `upstream_unavailable`.
@@ -222,8 +231,27 @@ Unit-tested in both directions (404 and 422 do not fall back, 429 and connect er
 | Latency cost of falling back to a **remote** backend | **untested, Bedrock** |
 | Cost of a fallback that reaches a paid backend | **untested, Bedrock** |
 | Fallback across a real network partition (both servers are on one host here) | untested |
-| Fallback when the primary is slow rather than dead — there is no timeout-triggered case | untested |
+| Fallback when the primary is slow rather than dead — there is no timeout-triggered case | **not implemented**, see below |
 | Policy routing under load (the policy tests are unit-level; no load run exercises `local_only`) | untested |
+
+### Not done: timeout-triggered fallback
+
+Fallback today fires on a backend that **fails**. A backend that is merely **slow** holds
+the request until `request_timeout` (120 s) and only then moves on, by which point
+falling back is useless.
+
+The intended shape, for the record, since this is the first thing to build after the
+Bedrock cells: a **first-byte budget per attempt**, separate from and much shorter than
+the whole-request timeout. When an attempt misses its budget, open the next backend and
+cancel the slow attempt as soon as the new one yields a first chunk — hedging, but only
+ever before the first byte, never after. The existing structure already enforces the
+"never after" half: the only two call sites that can fall back run before any yield to
+the client.
+
+**Untested and not implemented.** A slow region is exactly the case it exists for, which
+is why it waits for a remote backend to measure against rather than being guessed at
+locally — two Ollama servers on one Metal device cannot produce a realistic slow-but-alive
+backend.
 
 ---
 

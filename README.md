@@ -289,6 +289,7 @@ All three signals, correlated: a log line carries the `trace_id` of its trace.
 | `llm_tokens_generated_total` | Cumulative token count. Excludes cancelled requests — the count comes from a final chunk a disconnected client never gets |
 | `llm_requests_cancelled_total` | Streaming requests whose client hung up mid-stream. Separate from `llm_requests_total` so success/error ratios there keep their meaning |
 | `llm_fallbacks_total` | Times a tier's next backend was tried after the previous failed. Labelled by `tier`, `from_kind`, `to_kind`, `reason`. Only ever incremented **before** the first chunk reaches the client |
+| `llm_policy_downgrades_total` | Automatic routes rewritten to a cheaper tier by `local_only`. Labelled by `from_tier`, `to_tier`; `X-Model-Tier` reports the tier that served the request |
 
 ### Trace spans
 

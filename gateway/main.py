@@ -20,6 +20,7 @@ from .logger import log
 from .metrics import (
     FALLBACKS,
     IN_FLIGHT,
+    POLICY_DOWNGRADES,
     QUEUE_WAITING,
     REQUEST_COUNT,
     REQUESTS_CANCELLED,
@@ -139,6 +140,20 @@ async def lifespan(app: FastAPI):
             "remote_tiers": {t: str(cfg) for t, cfg in remote.items()},
             "note": "automatic routing can send requests to a paid backend",
         })
+        # Each half of this is legal on its own: auth off is the shipped default for
+        # local development, and a paid tier is a deliberate choice. Together they mean
+        # anyone who can reach the port can spend money, and no key is needed to do it —
+        # so there is also no routing policy available to stop them, because a policy
+        # attaches to a key. Logged as its own event rather than folded into the line
+        # above, so it can be alerted on.
+        if not settings.auth_enabled:
+            log.warning("remote_tiers_configured_without_auth", extra={
+                "remote_tiers": {t: str(cfg) for t, cfg in remote.items()},
+                "auth_enabled": False,
+                "note": "a paid backend is reachable by any caller that can reach this "
+                        "port, and with no API key there is no routing policy that can "
+                        "restrict it; set GATEWAY_AUTH_ENABLED and GATEWAY_API_KEYS",
+            })
     else:
         log.info("all_tiers_local", extra={
             "tiers": {t: str(cfg) for t, cfg in settings.tiers.items()},
@@ -282,7 +297,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         "stream": req.stream,
     })
     if route.downgraded_from:
-        # Allowed — automatic routing was never promised a tier — but never silent.
+        # Allowed — automatic routing was never promised a tier — but never silent, and
+        # counted rather than only logged: X-Model-Tier below already reports the tier
+        # that served the request, so without this counter the fact that a *different*
+        # tier was asked for leaves no trace a dashboard can see.
+        POLICY_DOWNGRADES.labels(from_tier=route.downgraded_from, to_tier=tier).inc()
         log.info("tier_downgraded", extra={
             "policy": policy, "from_tier": route.downgraded_from, "to_tier": tier,
             "reason": "policy forbids the original tier's backend",
@@ -398,8 +417,23 @@ def _classify_upstream(exc: Exception) -> tuple[int, str]:
 # A 4xx that means the *request* is wrong, not the backend. Retrying these against
 # another backend buys the same error at a second backend's price: an unknown model id
 # is unknown there too, and a prompt over the context limit is over it there too.
-# Everything else — connection failures, timeouts, 5xx, throttling, and auth problems
-# that may simply be this backend's credentials — is worth another backend's attempt.
+#
+# 401 and 403 DO fall back, which is the one entry here that could reasonably go the
+# other way. The reasoning: credentials are per backend, not per request. A 401 from
+# Bedrock says this gateway's AWS credentials are wrong or expired; it says nothing
+# about whether the next backend in the chain can serve the request, and that backend
+# very often has entirely separate credentials (or none, for a local one). Treating it
+# as non-retryable would mean one misconfigured backend takes down a tier that has a
+# working fallback sitting behind it.
+#
+# The cost of being wrong in this direction is bounded and visible: a second attempt
+# that also fails, and an llm_fallbacks_total{reason="upstream_error"} series that makes
+# a chain-wide auth problem obvious on a dashboard. The cost of the other direction is a
+# tier that is down while a healthy backend goes unused. Untested against a real 401 —
+# no credentialed backend has been configured yet.
+#
+# Everything else — connection failures, timeouts, 5xx and throttling — is worth another
+# backend's attempt.
 _NO_FALLBACK_STATUSES = frozenset({400, 404, 413, 422})
 
 

@@ -431,3 +431,118 @@ def test_startup_accepts_valid_policies():
     settings.tier_powerful = "ollama:llama3.1:8b"
     with TestClient(main.app):
         pass
+
+
+# --- downgrade observability ----------------------------------------------------------
+
+def downgrade_count(from_tier, to_tier) -> float:
+    return REGISTRY.get_sample_value("llm_policy_downgrades_total", {
+        "from_tier": from_tier, "to_tier": to_tier}) or 0.0
+
+
+def test_downgrade_is_counted_and_the_served_tier_is_reported(registry):
+    """A downgrade must leave a trace a dashboard can see, not just a log line."""
+    from fastapi.testclient import TestClient
+
+    class Fake:
+        async def health_check(self): return True
+        async def list_models(self): return []
+        async def generate(self, req): return "hi", 1, 1, {"timings": {}, "usage": {}}
+        async def generate_stream(self, req):
+            yield "hi", False, 1, {}
+            yield "", True, 1, {"timings": {}, "usage": {}}
+        async def close(self): pass
+
+    settings.auth_enabled = True
+    settings.api_keys = "k-local=local_only"
+    settings.tier_fast = "ollama:llama3.2:1b"
+    settings.tier_balanced = "ollama:llama3.1:8b"
+    settings.tier_powerful = "bedrock:some.big-model-v1:0"
+    before = downgrade_count("powerful", "balanced")
+
+    with TestClient(main.app) as client:
+        main._backends["ollama"] = Fake()
+        resp = client.post("/v1/chat/completions",
+                           headers={"Authorization": "Bearer k-local"},
+                           json={"model": "auto", "max_tokens": 4,
+                                 "messages": [{"role": "user", "content": COMPLEX}]})
+
+    assert resp.status_code == 200
+    # The header reports the tier that served the request, not the one asked for.
+    assert resp.headers["X-Model-Tier"] == "balanced"
+    assert resp.headers["X-Routing-Policy"] == "local_only"
+    assert resp.headers["X-Routed-Backend"] == "ollama"
+    assert downgrade_count("powerful", "balanced") == before + 1
+
+
+def test_no_downgrade_counted_when_nothing_is_rewritten(registry):
+    before = downgrade_count("fast", "fast")
+    route = resolve_route(req(SHORT), "local_only")
+    assert route.downgraded_from is None
+    assert downgrade_count("fast", "fast") == before
+
+
+def test_auth_off_plus_a_paid_tier_is_warned_about(caplog):
+    """Both halves are legal alone; together an open port can spend money."""
+    import logging
+    from fastapi.testclient import TestClient
+
+    settings.auth_enabled = False
+    settings.api_keys = ""
+    settings.tier_powerful = "bedrock:some.big-model-v1:0"
+    settings.aws_region = "us-west-2"
+
+    with caplog.at_level(logging.WARNING):
+        with TestClient(main.app):
+            pass
+
+    messages = [r.message for r in caplog.records]
+    assert "remote_tiers_configured" in messages
+    assert "remote_tiers_configured_without_auth" in messages
+
+
+def test_no_open_port_warning_when_auth_is_on(caplog):
+    import logging
+    from fastapi.testclient import TestClient
+
+    settings.auth_enabled = True
+    settings.api_keys = "k1"
+    settings.tier_powerful = "bedrock:some.big-model-v1:0"
+    settings.aws_region = "us-west-2"
+
+    with caplog.at_level(logging.WARNING):
+        with TestClient(main.app):
+            pass
+
+    messages = [r.message for r in caplog.records]
+    assert "remote_tiers_configured" in messages
+    assert "remote_tiers_configured_without_auth" not in messages
+
+
+def test_no_open_port_warning_when_every_tier_is_local(caplog):
+    import logging
+    from fastapi.testclient import TestClient
+
+    settings.auth_enabled = False
+    settings.tier_powerful = "ollama:llama3.2:1b"
+
+    with caplog.at_level(logging.WARNING):
+        with TestClient(main.app):
+            pass
+
+    assert "remote_tiers_configured_without_auth" not in [r.message for r in caplog.records]
+
+
+def test_auth_failure_falls_back_to_the_next_backend(registry):
+    """Credentials are per backend: a 401 says nothing about the next one."""
+    import httpx
+
+    request = httpx.Request("POST", "http://x/api/chat")
+    response = httpx.Response(401, request=request, text="bad credentials")
+    primary = Boom(httpx.HTTPStatusError("401", request=request, response=response))
+    secondary = Works()
+    registry.update({"a": primary, "b": secondary})
+
+    _resp, used = asyncio.run(
+        main._stream_response(req(SHORT, stream=True), "fast", 0.0, chain_route()))
+    assert used.kind == "b", "a per-backend auth failure took down a tier with a working fallback"

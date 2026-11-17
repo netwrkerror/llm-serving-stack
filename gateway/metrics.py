@@ -51,6 +51,15 @@ REQUESTS_CANCELLED = Counter(
     ["model"],
 )
 
+POLICY_DOWNGRADES = Counter(
+    "llm_policy_downgrades_total",
+    "Automatic routes rewritten to a cheaper tier because the key's policy forbade the "
+    "original tier's backend. A counter and not only a log line: a downgrade that lives "
+    "only in the log is invisible on every dashboard, which is the same defect found for "
+    "cancelled requests",
+    ["from_tier", "to_tier"],
+)
+
 FALLBACKS = Counter(
     "llm_fallbacks_total",
     "Times a tier's next backend was tried after the previous one failed. Only ever "
