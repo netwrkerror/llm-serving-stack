@@ -516,3 +516,59 @@ fall back, which at that point is far past useful. A per-attempt budget shorter 
 whole-request timeout is the obvious fix and is not implemented. Also untested: fallback
 across a real network partition, and policy routing under load — the `local_only` tests
 are all unit-level.
+
+## Stage 4 — quality per tier, local tiers (2026-11-16)
+
+**The 8B is worse than the 1B at code, and the reason is formatting, not capability.**
+70% → 60%. The two lost prompts are both "output only JSON": the 8B answered correctly
+and then kept explaining, 113 and 77 completion tokens against the 1B's 22 and 12, so the
+JSON check failed on the surrounding prose. That makes this column a measure of
+instruction-following as much as of ability, which is worth saying out loud before anyone
+reads "bigger model, lower score" as a surprise about model quality. Untested whether a
+stricter prompt or a JSON-mode request reverses it — and if it does, that is a finding
+about the eval, not the models.
+
+**`powerful` is unreachable for this workload, not merely unused.** Zero of 30 prompts
+contain any of the 25 complexity keywords, and the longest is 33 words against a 120-word
+threshold. So every decision is the 20-word boundary, 22 prompts go to `fast`, 8 to
+`balanced`, and the keyword half of the heuristic contributes **nothing at all**. The
+cheap outcome, arrived at by accident: `reason-03` goes to `fast`, which scored 0/2 on
+graded reasoning.
+
+**My own eval set does not exercise the heuristic's known failure mode.** The
+substring-containment false positives pinned in `tests/test_router.py` — "analyzer"
+matching "analyze", "designer" matching "design" — never fire here, because no prompt
+contains those substrings. I wrote the prompts to be a realistic mixed workload and
+separately know the router has that bug, and did not connect the two until reading the
+`auto` column. The 0 in the `powerful` column is therefore not evidence the heuristic is
+safe; it is evidence this set does not test that path. A deliberate adversarial prompt or
+two would fix it, and would also change the routing distribution, which is why it is
+flagged rather than quietly added after the fact.
+
+**The 15-token template gap reproduced exactly at scale.** 47.5 vs 32.5 mean prompt
+tokens across 30 prompts, against 32 vs 17 measured on one prompt last stage. 450 tokens
+of difference for identical inputs, same tokenizer, purely because `llama3.2`'s template
+emits an unconditional system block and `llama3.1`'s does not. This is the clearest
+argument for the per-cell token column being mandatory rather than nice to have: a
+per-token cost comparison between these tiers would silently compare different inputs.
+
+**Rubrics are recorded, not guessed.** 8 of the 10 reasoning prompts are rubric checks,
+and the runner returns `None` for them rather than attempting a grade. The cost is an
+honest two-prompt-wide graded reasoning column; the alternative was a plausible-looking
+rate built on the runner's opinion of its own output. Flagged in `eval/README.md` so the
+narrow column is not mistaken for a measurement.
+
+**On the 1B-resident caveat, which this run avoids.** Nothing was resident at the start,
+and Ollama evicted the 1B when the 8B loaded — `api/ps` showed only `llama3.1:8b`
+afterwards. The runner does all of one tier then all of the next, so the 8B cell ran with
+the 8B alone, unlike the latency cell where both were resident. That is the cleaner
+configuration, and it happened by Ollama's choice rather than mine. Swap still grew
+14.67 → 18.22 GB, which does not qualify pass counts but does qualify the latency numbers
+sitting in `results.json`.
+
+**Unsure / flagged:** single run per tier, `temperature=0`, no repeats — so no
+variance figure, and `temperature=0` is not fully deterministic across a batched backend
+anyway. The regex checks are hand-written and loose where the prompt does not demand
+terseness; a model could pass `fact-05` by saying "time to first token" inside an
+otherwise wrong answer. And the graded rates are not comparable across categories, which
+is exactly why there is no blended number.

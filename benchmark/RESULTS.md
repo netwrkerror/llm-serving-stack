@@ -14,6 +14,124 @@ not measured is not listed here.
 
 ---
 
+## Quality per tier, local tiers (2026-11-16)
+
+The cost table's quality column, for the two tiers that exist without credentials. The
+Bedrock cell is a rerun of one tier away — see `eval/README.md`.
+
+**Conditions**
+
+| | |
+|---|---|
+| Date | 2026-11-16, 17:42 MST |
+| Hardware | Apple M5 Pro (`Mac17,9`), arm64, 24 GiB |
+| Ollama | 0.32.5, `library=Metal`, `OLLAMA_NUM_PARALLEL:4` |
+| Gateway | compose at `1bad7ca`, `fast`=`ollama:llama3.2:1b`, `balanced`=`ollama:llama3.1:8b` |
+| Eval set | `eval/prompts.jsonl` @ **`1bad7ca`**, committed before this run, clean (not `-DIRTY`) |
+| Load | 30 prompts × 2 tiers, sequential, `temperature=0`, `max_tokens=256` |
+| Run dir | `benchmark/out/run-eval-1bad7ca-20261116-174250/` |
+
+Sequential on purpose: concurrency would add queue wait to the latency column, and this
+eval is about answers rather than throughput.
+
+### Pass counts per category per tier
+
+Graded = mechanical checks only (exact / regex / json). Rubric prompts are recorded with
+their completions and **not graded by the runner**, so they can never inflate a rate.
+
+| tier | model | category | graded | passed | rate | rubric (ungraded) |
+|------|-------|----------|--------|--------|------|-------------------|
+| `fast` | `llama3.2:1b` | factual | 10 | 6 | 60% | 0 |
+| `fast` | `llama3.2:1b` | reasoning | 2 | 0 | 0% | 8 |
+| `fast` | `llama3.2:1b` | code | 10 | 7 | 70% | 0 |
+| `balanced` | `llama3.1:8b` | factual | 10 | **9** | **90%** | 0 |
+| `balanced` | `llama3.1:8b` | reasoning | 2 | 1 | 50% | 8 |
+| `balanced` | `llama3.1:8b` | code | 10 | **6** | **60%** | 0 |
+
+**No blended score is reported.** The categories are not commensurable, and 8 of the 10
+reasoning prompts are ungraded rubrics, so the graded reasoning column is two prompts
+wide — indicative at best.
+
+**The 8B is better on facts and worse on code**, which is the opposite of the expected
+ordering and worth not smoothing over. 90% vs 60% on factual is a clear win. On code it
+loses 70% → 60%, and the per-prompt records say why: the failures are the
+"output only JSON" prompts (`code-03`, `code-10`), where the 8B emitted 113 and 77
+completion tokens against the 1B's 22 and 12. It answered correctly and then kept
+talking, and the check tests instruction-following as much as capability. So this column
+measures **format compliance**, not reasoning ability, and a bigger model being chattier
+costs it marks here. Untested: whether a stricter prompt or a JSON-mode request would
+reverse it.
+
+### Prompt tokens per cell
+
+| tier | model | prompt tokens, total | mean | completion tokens, total |
+|------|-------|----------------------|------|--------------------------|
+| `fast` | `llama3.2:1b` | 1426 | 47.5 | 811 |
+| `balanced` | `llama3.1:8b` | 976 | 32.5 | 948 |
+
+Mean difference is **exactly 15.0 tokens per prompt**, which independently reproduces the
+template finding in `NOTES.md` (measured there as 32 vs 17 on a single prompt). The
+`llama3.2` template emits a system block with a knowledge-cutoff line unconditionally;
+the `llama3.1` template emits none when there is no system message and no tools. Same
+tokenizer, same prompts, 450 tokens of difference across 30 requests.
+
+This is why prompt tokens are recorded per cell. Any cost-per-request comparison between
+these tiers is comparing different input token counts for identical prompts, and a
+per-token price would not notice.
+
+### What `classify()` would have done under `auto`
+
+| category | → `fast` | → `balanced` | → `powerful` |
+|----------|----------|--------------|--------------|
+| factual | 9 | 1 | 0 |
+| reasoning | 4 | 6 | 0 |
+| code | 9 | 1 | 0 |
+| **total** | **22** | **8** | **0** |
+
+**`powerful` is unreachable for this workload.** Not under-used — unreachable. The
+heuristic sends a prompt to `powerful` only on a complexity keyword or ≥120 words, and
+**no prompt in the set contains any of the 25 keywords**, while the longest is 33 words.
+So every routing decision here is pure word count against the 20-word boundary, and 73%
+of the workload lands on the cheapest tier.
+
+Two honest consequences:
+
+- For a workload shaped like this, the keyword half of the heuristic contributes nothing
+  at all, and the expensive tier would never be billed. That is the cheap outcome, but it
+  is cheap by accident rather than by judgment: `reason-03` ("explain in one sentence why
+  a semaphore…") goes to `fast`, which scored 0/2 on graded reasoning.
+- The substring false positives pinned in `tests/test_router.py` ("analyzer" matching
+  "analyze") **do not fire here**, because no prompt contains those substrings. The risk
+  is real and tested, but this prompt set does not exercise it. That is a gap in the eval
+  set, not evidence the heuristic is safe.
+
+**Cost of that routing: untested, Bedrock.** The local tiers have no measured marginal
+cost — the laptop is not metered — so there is no price to multiply these counts by.
+
+### Memory, and which models were resident
+
+Nothing was resident when the run started. The runner does all of `fast` and then all of
+`balanced`, and Ollama **evicted the 1B when the 8B loaded**: `api/ps` showed only
+`llama3.1:8b` afterwards. So unlike the latency cell in the 8B section above, this 8B
+cell ran with the 8B alone resident, which is the cleaner configuration of the two.
+
+Swap used still grew 14.67 GB → 18.22 GB over the run on a machine that was already
+swapping. Latency is not the measurement here, so this does not qualify the pass counts;
+it is recorded because it qualifies anything anyone later tries to read out of the
+latency figures in `results.json`.
+
+### Not measured
+
+| | |
+|---|---|
+| Bedrock tier quality | **untested, Bedrock** — one env var and a single-tier rerun |
+| Cost per correct answer | **untested, Bedrock** — needs both a price and a measured marginal cost |
+| The 8 rubric prompts | ungraded by design; recorded with completions for grading |
+| Whether the code-category gap survives a stricter prompt or JSON mode | untested |
+| Run-to-run variance | single run per tier at `temperature=0`; no repeats |
+
+---
+
 ## Policy routing and fallback (2026-11-16)
 
 Fallback measured with two local Ollama servers, so this is the **mechanism** — does
