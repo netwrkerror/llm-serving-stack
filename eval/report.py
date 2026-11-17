@@ -8,6 +8,11 @@ Separate from run.py because grading happens after the run: the runner records w
 tier said, this merges in what a human decided about it. Keeping them apart means a
 regrade never requires re-running the models.
 
+Every item is graded twice. `grader: "author"` is **the result**; `grader:
+"claude-session"` is reported alongside, because a model grading a model's output is not
+independent of what is being measured. Disagreements are listed in full with both
+reasons, since those are the informative part.
+
 Every grade carries the sha256 of the completion it was made against, and this script
 **verifies it**. A grade whose hash no longer matches is reported as stale rather than
 counted, because a grade silently attached to a different completion is worse than no
@@ -32,6 +37,21 @@ def load(run_dir: Path):
     return data, grades
 
 
+def _compare(a: dict, b: dict) -> tuple[int, list[tuple[str, tuple[str, str]]]]:
+    """(items both graded the same, list of (dimension, key) where they differ)."""
+    agree, differ = 0, []
+    for dim, items in a.items():
+        for key, verdict in items.items():
+            other = b.get(dim, {}).get(key)
+            if other is None:
+                continue
+            if other == verdict:
+                agree += 1
+            else:
+                differ.append((dim, key))
+    return agree, sorted(differ)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Merge hand grades into a run's results.")
     ap.add_argument("--run", required=True)
@@ -42,23 +62,35 @@ def main() -> int:
     data, grades = load(run_dir)
     results = {(r["prompt_id"], r["tier"]): r for r in data["results"]}
 
-    # dimension -> (prompt, tier) -> passed
-    graded: dict[str, dict[tuple[str, str], bool]] = defaultdict(dict)
+    # grader -> dimension -> (prompt, tier) -> passed, and the reasons alongside
+    by_grader: dict[str, dict[str, dict[tuple[str, str], bool]]] = defaultdict(
+        lambda: defaultdict(dict))
+    reasons: dict[tuple[str, str, str, str], str] = {}
     stale: list[str] = []
     orphan: list[str] = []
     for entry in grades:
         key = (entry["prompt_id"], entry["tier"])
+        grader = entry.get("grader", "unknown")
         res = results.get(key)
         if res is None:
             orphan.append(f"{key[0]} [{key[1]}] — no such cell in this run")
             continue
         digest = hashlib.sha256(res["completion"].encode()).hexdigest()
         if digest != entry["completion_sha256"]:
-            stale.append(f"{key[0]} [{key[1]}] {entry['dimension']} — "
+            stale.append(f"{key[0]} [{key[1]}] {entry['dimension']} [{grader}] — "
                          f"graded {entry['completion_sha256'][:12]}, "
                          f"run has {digest[:12]}")
             continue
-        graded[entry["dimension"]][key] = entry["passed"]
+        if entry.get("passed") is None:
+            continue  # not yet graded by this grader
+        by_grader[grader][entry["dimension"]][key] = entry["passed"]
+        reasons[(grader, entry["dimension"], *key)] = entry.get("reason", "")
+
+    # The author's grades are the result. Until they exist, the session's are shown and
+    # labelled as such rather than presented as the answer.
+    primary = "author" if by_grader.get("author") else "claude-session"
+    graded = by_grader[primary]
+    secondary = "claude-session" if primary == "author" else None
 
     tiers = list(dict.fromkeys(r["tier"] for r in data["results"]))
     lines: list[str] = []
@@ -68,9 +100,17 @@ def main() -> int:
     w(f"eval set @ {data['conditions']['prompts_commit']} | "
       f"temperature={data['conditions']['temperature']} | "
       f"max_tokens={data['conditions']['max_tokens']}")
-    graders = sorted({e.get("grader", "?") for e in grades})
-    w(f"hand grades: {len(grades)} ({', '.join(graders) or 'none'}), "
-      f"{len(stale)} stale, {len(orphan)} orphaned")
+    filled = {g: sum(len(d) for d in dims.values()) for g, dims in by_grader.items()}
+    total_items = sum(1 for e in grades if e.get("grader") == "author")
+    w(f"graders: " + ", ".join(f"{g} {n}/{total_items}" for g, n in sorted(filled.items()))
+      + (f" | {len(stale)} stale, {len(orphan)} orphaned" if stale or orphan else ""))
+    w(f"reported column: {primary}"
+      + ("" if primary == "author" else
+         "  <-- PENDING: the author has not graded yet, so these are the session's "
+         "grades and are not the result"))
+    if secondary:
+        agree, differ = _compare(by_grader["author"], by_grader[secondary])
+        w(f"agreement: {agree}/{agree + len(differ)} items where both graders have a verdict")
     w("")
 
     # --- reasoning, now fully graded ---
@@ -135,6 +175,22 @@ def main() -> int:
         w("orphaned grades — for cells not in this run")
         for o in orphan:
             w(f"  {o}")
+        w("")
+
+    # --- disagreements ---
+    if secondary:
+        _agree, differ = _compare(by_grader["author"], by_grader[secondary])
+        w(f"disagreements between author and {secondary} — {len(differ)} items")
+        if not differ:
+            w("  none")
+        for dim, key in differ:
+            pid, tier = key
+            a = by_grader["author"][dim][key]
+            b = by_grader[secondary][dim][key]
+            w(f"  {pid} [{tier}] {dim}: author={'pass' if a else 'FAIL'}, "
+              f"{secondary}={'pass' if b else 'FAIL'}")
+            w(f"      author: {reasons.get(('author', dim, pid, tier), '')}")
+            w(f"      {secondary}: {reasons.get((secondary, dim, pid, tier), '')}")
         w("")
 
     # --- per prompt, every dimension ---

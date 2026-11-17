@@ -36,11 +36,21 @@ eval is about answers rather than throughput.
 
 ### Pass counts per category per tier
 
-Reasoning is now **10 wide**: the 8 rubric prompts were hand-graded for both tiers, by
-me (Claude Opus 5), one at a time against the rubric in `prompts.jsonl`. **No model was
-used as judge.** Every grade is in `eval/grades.jsonl` with the sha256 of the completion
-it was made against and a one-sentence reason; `eval/report.py` verifies those hashes and
-refuses to count a grade whose completion has changed.
+**Read this before the numbers: the mechanical column understates both tiers.** Two of
+the committed code checks reject correct answers — see the correction below — so the
+regex/json pass counts are a floor, not a measurement of capability.
+
+Reasoning is **10 wide**: the 8 rubric prompts are hand-graded for both tiers. Grading is
+**by the author**, with an independent pass by Claude in the working session reported
+alongside and every disagreement listed. The session's pass is not independent of what is
+being measured — a model grading a model's output — which is why the author's column is
+the result. Every grade is in `eval/grades.jsonl` with the sha256 of the completion it was
+made against and a one-sentence reason; `eval/report.py` verifies those hashes and refuses
+to count a grade whose completion has changed.
+
+> **The numbers in the table below are the `claude-session` column.** They are replaced
+> by the author's grades once those are filled in, and the conditions block then carries
+> the agreement count. Pending.
 
 | tier | model | factual | reasoning | code: content | code: format |
 |------|-------|---------|-----------|---------------|--------------|

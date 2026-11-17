@@ -64,10 +64,21 @@ Each prompt carries one of:
 | `content` | all 10 code prompts | is the substantive answer right? |
 | `format` | all 10 code prompts | did it obey "output only ..."? |
 
-**Grader: Claude Opus 5, by hand**, named in every line. Each completion was read and
-decided one at a time against the rubric, with the reason recorded. **No model was used
-as a judge** — not even for a first pass — because a model grading its own family's
-output produces a number that looks like evidence and is not.
+**Graded by the author. Independently graded by Claude in the working session;
+disagreements listed in the report.**
+
+Every item is graded twice, by two graders recorded in the `grader` field:
+
+| `grader` | who | counted as |
+|----------|-----|------------|
+| `author` | Aakash, by hand | **the result** |
+| `claude-session` | Claude, in the working session that produced the run | reported alongside |
+
+The author's column is the reported number. The session's column is kept because a
+second opinion is worth having and because the disagreements are informative — but it is
+**not** independent of the thing being measured: a model grading a model's output is
+model-as-judge however carefully the reasons are written down, and an earlier version of
+this file claimed otherwise. The two columns exist so that claim does not have to be made.
 
 Every grade carries the `sha256` of the completion it was made against.
 
