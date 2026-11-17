@@ -12,12 +12,13 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from opentelemetry import trace as otel_trace
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from .auth import APIKeyMiddleware
+from .auth import APIKeyMiddleware, api_key_from, routing_policy_for
 from .backend import Backend, make_backend
-from .config import settings
+from .config import POLICIES, TierConfig, settings
 from .limiter import rate_limiter
 from .logger import log
 from .metrics import (
+    FALLBACKS,
     IN_FLIGHT,
     QUEUE_WAITING,
     REQUEST_COUNT,
@@ -27,7 +28,7 @@ from .metrics import (
     TOKENS_GENERATED,
     TTFT,
 )
-from .router import resolve_route
+from .router import Route, RouteRefused, resolve_route
 from .tracing import get_tracer, setup_tracing
 from .schemas import (
     ChatCompletionChoice,
@@ -103,6 +104,21 @@ async def _log_bedrock_lifecycles() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_tracing()
+
+    # Refuse to start on an unrecognised routing policy. Defaulting a misspelt
+    # "local_only" to "auto" would hand that key exactly the paid backends it was
+    # configured not to reach, and nothing downstream would look wrong.
+    invalid = settings.invalid_key_policies
+    if invalid:
+        log.error("invalid_key_policies", extra={
+            "invalid": {k[:4] + "…": p for k, p in invalid.items()},
+            "valid": list(POLICIES),
+        })
+        raise RuntimeError(
+            f"unrecognised routing policies in GATEWAY_API_KEYS: "
+            f"{sorted(set(invalid.values()))}; valid policies are {', '.join(POLICIES)}"
+        )
+
     for kind in settings.active_kinds:
         _backends[kind] = make_backend(kind)
 
@@ -225,7 +241,7 @@ async def prometheus_metrics():
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     arrival = time.perf_counter()
-    api_key = request.headers.get("Authorization", "")[len("Bearer "):].strip() or "anonymous"
+    api_key = api_key_from(request)
 
     allowed, reason = rate_limiter.check_request(api_key)
     if not allowed:
@@ -235,7 +251,20 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if not allowed:
         raise HTTPException(status_code=429, detail=reason)
 
-    route = resolve_route(req)
+    policy = routing_policy_for(request)
+    try:
+        route = resolve_route(req, policy)
+    except RouteRefused as refused:
+        # A refusal is reported, not worked around. The alternative — quietly serving a
+        # cheaper tier than was asked for — is the same class of bug as quietly serving
+        # a paid one, just in the direction nobody notices until the answers are worse.
+        log.warning("route_refused", extra={
+            "policy": policy, "http_status": refused.status, "error": refused.message,
+        })
+        resp = _openai_error(refused.status, refused.message, refused.err_type)
+        resp.headers["X-Routing-Policy"] = policy
+        return resp
+
     routed_model = route.model
     # A named model that matches no tier has no tier; the header still has to say
     # something, and "none" is the honest answer.
@@ -247,25 +276,35 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         "tier": tier,
         "backend_kind": route.kind,
         "explicit_model": route.explicit,
+        "policy": policy,
+        "route_source": route.source,
+        "chain": [str(cfg) for cfg in route.chain],
         "stream": req.stream,
     })
-
-    impl = backend_for(route.kind)
+    if route.downgraded_from:
+        # Allowed — automatic routing was never promised a tier — but never silent.
+        log.info("tier_downgraded", extra={
+            "policy": policy, "from_tier": route.downgraded_from, "to_tier": tier,
+            "reason": "policy forbids the original tier's backend",
+        })
 
     if req.stream:
-        resp: Response = await _stream_response(req, tier, arrival, impl, route.kind)
+        resp, used = await _stream_response(req, tier, arrival, route)
     else:
         # JSONResponse rather than the Pydantic model directly, so the headers below
         # apply to both paths.
         try:
-            resp = JSONResponse(
-                content=(await _sync_response(req, tier, arrival, impl, route.kind)).model_dump())
+            body, used = await _sync_response(req, tier, arrival, route)
+            resp = JSONResponse(content=body.model_dump())
         except _UpstreamFailure as fail:
             resp = _openai_error(fail.status, fail.message, fail.err_type)
+            used = TierConfig(route.kind, route.model)
 
+    # Report what answered, not what was planned: with a fallback chain those differ.
     resp.headers["X-Model-Tier"] = tier
-    resp.headers["X-Routed-Model"] = routed_model
-    resp.headers["X-Routed-Backend"] = route.kind
+    resp.headers["X-Routed-Model"] = used.model
+    resp.headers["X-Routed-Backend"] = used.kind
+    resp.headers["X-Routing-Policy"] = policy
     return resp
 
 
@@ -356,6 +395,26 @@ def _classify_upstream(exc: Exception) -> tuple[int, str]:
     return 500, "internal_error"
 
 
+# A 4xx that means the *request* is wrong, not the backend. Retrying these against
+# another backend buys the same error at a second backend's price: an unknown model id
+# is unknown there too, and a prompt over the context limit is over it there too.
+# Everything else — connection failures, timeouts, 5xx, throttling, and auth problems
+# that may simply be this backend's credentials — is worth another backend's attempt.
+_NO_FALLBACK_STATUSES = frozenset({400, 404, 413, 422})
+
+
+def _should_fallback(exc: BaseException) -> tuple[bool, str]:
+    """(may we try the next backend, a short reason for the metric)."""
+    if isinstance(exc, StopAsyncIteration):
+        return True, "no_output"
+    if not isinstance(exc, Exception):
+        return False, "cancelled"
+    status, err_type = _classify_upstream(exc)
+    if status in _NO_FALLBACK_STATUSES:
+        return False, err_type
+    return True, err_type
+
+
 def _openai_error(status: int, message: str, err_type: str) -> JSONResponse:
     return JSONResponse(
         status_code=status,
@@ -369,16 +428,58 @@ async def _prepend(first, rest: AsyncIterator) -> AsyncIterator:
         yield item
 
 
-async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float,
-                           backend: Backend, kind: str) -> Response:
-    """Open the backend stream and read its first chunk before returning a response.
+async def _open_first_chunk(route: Route, req: ChatCompletionRequest, span):
+    """Walk the tier's chain until one backend yields its first chunk.
 
-    Once a StreamingResponse is returned, the 200 and the SSE content-type are already
-    committed, so a failure after that can only be an error chunk. Pulling the first
-    chunk here means a dead backend or an unknown model still gets a real status code.
-    Failures after this point stay 200 + an error chunk, as the protocol requires.
+    Returns (agen, first, cfg) for whichever backend answered. Raises the last
+    exception if none did.
+
+    This is the only place fallback can happen, and that is a protocol constraint
+    rather than a choice: once a StreamingResponse is returned the 200 and the SSE
+    content-type are committed, so a later failure can only be an in-band error chunk.
+    Pulling the first chunk eagerly is what buys the chance to try another backend
+    while a real status code is still possible.
     """
-    model = req.model
+    last_exc: BaseException | None = None
+    for index, cfg in enumerate(route.chain):
+        impl = backend_for(cfg.kind)
+        attempt = req.model_copy(update={"model": cfg.model}) if cfg.model != req.model else req
+        agen = impl.generate_stream(attempt)
+        try:
+            first = await agen.__anext__()
+            if index:
+                span.set_attribute("llm.fallback", f"{route.chain[0].kind}->{cfg.kind}")
+                span.set_attribute("llm.fallback.attempts", index + 1)
+            return agen, first, cfg
+        except BaseException as exc:
+            await agen.aclose()
+            last_exc = exc
+            may_retry, reason = _should_fallback(exc)
+            is_last = index == len(route.chain) - 1
+            if not may_retry or is_last:
+                raise
+            nxt = route.chain[index + 1]
+            FALLBACKS.labels(tier=route.tier or "none", from_kind=cfg.kind,
+                             to_kind=nxt.kind, reason=reason).inc()
+            log.warning("backend_fallback", extra={
+                "tier": route.tier or "none",
+                "from_kind": cfg.kind, "from_model": cfg.model,
+                "to_kind": nxt.kind, "to_model": nxt.model,
+                "reason": reason, "error": str(exc),
+            })
+    raise last_exc if last_exc else RuntimeError("empty backend chain")
+
+
+async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float,
+                           route: Route) -> tuple[Response, TierConfig]:
+    """Open the backend stream, falling back while that is still possible, and return
+    a streaming response plus the backend that actually answered.
+
+    Failures after the first chunk stay 200 + an error chunk, as the protocol requires,
+    and are never retried.
+    """
+    model = route.model
+    kind = route.kind
     # Absent stream_options means send usage; an explicit value wins either way.
     include_usage = req.stream_options.include_usage if req.stream_options else True
     t = get_tracer()
@@ -388,7 +489,6 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
     _set_span_attrs(span, req, tier, kind)
 
     acquired = False
-    agen = None
     inf_span = None
     try:
         with otel_trace.use_span(span, end_on_exit=False):
@@ -398,11 +498,12 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
             inf_span = t.start_span("llm.inference")
             with otel_trace.use_span(inf_span, end_on_exit=False):
                 gen_start = time.perf_counter()
-                agen = backend.generate_stream(req)
-                first = await agen.__anext__()
+                agen, first, used = await _open_first_chunk(route, req, span)
+                # The chain entry that answered may not be the primary.
+                model, kind = used.model, used.kind
+                inf_span.set_attribute("llm.backend", kind)
+                inf_span.set_attribute("llm.model", model)
     except BaseException as exc:
-        if agen is not None:
-            await agen.aclose()
         if acquired:
             _queue.release()
         IN_FLIGHT.labels(model=model).dec()
@@ -424,8 +525,11 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
         REQUEST_DURATION.labels(model=model, stream="true", status="error").observe(
             time.perf_counter() - arrival
         )
-        log.error("request_failed", extra={"model": model, "error": message, "http_status": status})
-        return _openai_error(status, message, err_type)
+        log.error("request_failed", extra={
+            "model": model, "backend_kind": kind,
+            "error": message, "http_status": status,
+        })
+        return _openai_error(status, message, err_type), TierConfig(kind, model)
 
     async def event_stream() -> AsyncIterator[str]:
         first_token_recorded = False
@@ -578,11 +682,49 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
             inf_span.end()
             span.end()
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return (StreamingResponse(event_stream(), media_type="text/event-stream"),
+            TierConfig(kind, model))
+
+async def _generate_with_fallback(route: Route, req: ChatCompletionRequest, span):
+    """Walk the tier's chain for a non-streaming request.
+
+    Fallback is unconditionally safe here: nothing is sent to the client until the whole
+    completion exists, so there is no first-byte deadline to respect. The same
+    non-retryable statuses still apply — a bad model id is bad everywhere.
+    """
+    last_exc: BaseException | None = None
+    for index, cfg in enumerate(route.chain):
+        impl = backend_for(cfg.kind)
+        attempt = req.model_copy(update={"model": cfg.model}) if cfg.model != req.model else req
+        try:
+            result = await impl.generate(attempt)
+            if index:
+                span.set_attribute("llm.fallback", f"{route.chain[0].kind}->{cfg.kind}")
+                span.set_attribute("llm.fallback.attempts", index + 1)
+            return result, cfg
+        except BaseException as exc:
+            last_exc = exc
+            may_retry, reason = _should_fallback(exc)
+            is_last = index == len(route.chain) - 1
+            if not may_retry or is_last:
+                raise
+            nxt = route.chain[index + 1]
+            FALLBACKS.labels(tier=route.tier or "none", from_kind=cfg.kind,
+                             to_kind=nxt.kind, reason=reason).inc()
+            log.warning("backend_fallback", extra={
+                "tier": route.tier or "none",
+                "from_kind": cfg.kind, "from_model": cfg.model,
+                "to_kind": nxt.kind, "to_model": nxt.model,
+                "reason": reason, "error": str(exc), "stream": False,
+            })
+    raise last_exc if last_exc else RuntimeError("empty backend chain")
+
 
 async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float,
-                         backend: Backend, kind: str) -> ChatCompletionResponse:
-    model = req.model
+                         route: Route) -> tuple[ChatCompletionResponse, TierConfig]:
+    model = route.model
+    kind = route.kind
+    used = TierConfig(route.kind, route.model)
     t = get_tracer()
     IN_FLIGHT.labels(model=model).inc()
     try:
@@ -595,7 +737,11 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float,
                 with t.start_as_current_span("llm.inference") as inf_span:
                     start = time.perf_counter()
                     try:
-                        text, prompt_tok, completion_tok, meta = await backend.generate(req)
+                        (text, prompt_tok, completion_tok, meta), used = \
+                            await _generate_with_fallback(route, req, span)
+                        model, kind = used.model, used.kind
+                        inf_span.set_attribute("llm.backend", kind)
+                        inf_span.set_attribute("llm.model", model)
                     except Exception as exc:
                         REQUEST_COUNT.labels(model=model, status="error", stream="false").inc()
                         REQUEST_DURATION.labels(model=model, stream="false", status="error").observe(
@@ -640,7 +786,7 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float,
                             completion_tokens=completion_tok,
                             total_tokens=prompt_tok + completion_tok,
                         ),
-                    )
+                    ), used
             finally:
                 _queue.release()
     finally:

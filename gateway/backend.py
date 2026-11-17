@@ -60,9 +60,11 @@ def _extract_usage(data: dict) -> dict[str, int]:
 
 
 class OllamaBackend:
-    def __init__(self) -> None:
+    def __init__(self, base_url: str | None = None) -> None:
+        # Explicit URL so a fallback chain can span two Ollama servers; falls back to
+        # the single-URL configuration Part 1 uses.
         self.client = httpx.AsyncClient(
-            base_url=settings.backend_url,
+            base_url=base_url or settings.url_for("ollama"),
             timeout=httpx.Timeout(settings.request_timeout),
         )
 
@@ -146,10 +148,10 @@ class OpenAICompatBackend:
     No timings are available — those are an Ollama-specific extension.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, base_url: str | None = None) -> None:
         headers = {"Authorization": f"Bearer {settings.backend_api_key}"} if settings.backend_api_key else {}
         self.client = httpx.AsyncClient(
-            base_url=settings.backend_url,
+            base_url=base_url or settings.url_for("openai"),
             timeout=httpx.Timeout(settings.request_timeout),
             headers=headers,
         )

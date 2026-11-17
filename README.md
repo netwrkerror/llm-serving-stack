@@ -66,7 +66,9 @@ VRAM, which is what makes aggressive batching practical.
 | `gateway/` | FastAPI app — admission control, sync + streaming inference, routing, auth, rate limiting |
 | `observability/` | Prometheus + Grafana, Jaeger traces, Loki/Promtail logs |
 | `benchmark/` | 5-scenario load test, ending oversubscribed so gateway queueing shows up |
-| Routing | `model` absent or `"auto"` picks a tier from prompt complexity; naming a model is honoured as-is. Each tier names its own backend, so the tier picks where the request goes. `X-Model-Tier` / `X-Routed-Model` / `X-Routed-Backend` on the response |
+| Routing | Precedence: a named `model` wins, then `routing: {"tier": ...}`, then the key's policy, then prompt complexity. A named model is honoured as-is and never re-routed. `X-Model-Tier` / `X-Routed-Model` / `X-Routed-Backend` / `X-Routing-Policy` on the response |
+| Policy | Per-key `routing_policy`: `auto`, `local_only` (never a paid backend; automatic routes are downgraded, explicit ones get 403), or a pinned tier. See [benchmark/NOTES.md](benchmark/NOTES.md) for the full precedence table |
+| Fallback | A tier may list several backends. Tried **only before the first chunk reaches the client**; after that a failure is an in-band error chunk. A 400/404/413/422 is never retried — the next backend would give the same answer and charge for it |
 | Backends | `ollama`, `openai` (vLLM / TGI / Ollama's `/v1`), and `bedrock` (Converse API, async via aioboto3). Built per kind at startup, closed on shutdown. **Bedrock is untested against the live API** — see [benchmark/RESULTS.md](benchmark/RESULTS.md) |
 | Auth | API key middleware — **off by default**, set `GATEWAY_AUTH_ENABLED` and `GATEWAY_API_KEYS` |
 | Rate limiting | Per-key requests/min and token budget — **off by default**, set `GATEWAY_RATE_LIMIT_ENABLED` |
@@ -286,6 +288,7 @@ All three signals, correlated: a log line carries the `trace_id` of its trace.
 | `llm_tokens_per_second` | Generation throughput, excluding queue wait |
 | `llm_tokens_generated_total` | Cumulative token count. Excludes cancelled requests — the count comes from a final chunk a disconnected client never gets |
 | `llm_requests_cancelled_total` | Streaming requests whose client hung up mid-stream. Separate from `llm_requests_total` so success/error ratios there keep their meaning |
+| `llm_fallbacks_total` | Times a tier's next backend was tried after the previous failed. Labelled by `tier`, `from_kind`, `to_kind`, `reason`. Only ever incremented **before** the first chunk reaches the client |
 
 ### Trace spans
 
@@ -310,7 +313,8 @@ with no configuration; turn them on explicitly.
 | Variable | Default | Notes |
 |----------|---------|-------|
 | `GATEWAY_BACKEND` | `ollama` | `ollama` or `openai`. The default **kind** for any tier that does not name its own |
-| `GATEWAY_TIER_FAST` / `_BALANCED` / `_POWERFUL` | _(empty → local)_ | `kind:model`, kind in `ollama` \| `openai` \| `bedrock`, e.g. `bedrock:<model-id>`. A bare model name uses `GATEWAY_BACKEND` as its kind. **All three ship empty, so nothing in automatic routing can reach a paid backend unless you set one** |
+| `GATEWAY_TIER_FAST` / `_BALANCED` / `_POWERFUL` | _(empty → local)_ | `kind:model`, kind in `ollama` \| `openai` \| `bedrock`, e.g. `bedrock:<model-id>`. A bare model name uses `GATEWAY_BACKEND` as its kind. Comma-separated for a **fallback chain**: `"ollama:llama3.2:1b,openai:llama3.2:1b"`. **All three ship empty, so nothing in automatic routing can reach a paid backend unless you set one** |
+| `GATEWAY_OLLAMA_URL` / `GATEWAY_OPENAI_URL` | _(empty → `GATEWAY_BACKEND_URL`)_ | per-kind base URLs, so a chain can span two servers |
 | `GATEWAY_AWS_REGION` | _(empty → credential chain)_ | Bedrock region. Credentials come from the standard AWS chain only — never from config |
 | `GATEWAY_BEDROCK_TIMEOUT` | `120.0` | read timeout for Bedrock calls, seconds |
 | `GATEWAY_BACKEND_URL` | `http://localhost:11434` | must match the protocol — add `/v1` for `openai` |
@@ -320,7 +324,7 @@ with no configuration; turn them on explicitly.
 | `GATEWAY_DEFAULT_MODEL` | `llama3.2:1b` | fallback only — the model used for a tier that has not been configured |
 | `GATEWAY_MODEL_FAST` / `_BALANCED` / `_POWERFUL` | _(empty → `GATEWAY_DEFAULT_MODEL`)_ | routing tiers, all the same model until you pull more |
 | `GATEWAY_AUTH_ENABLED` | `false` | **off by default** |
-| `GATEWAY_API_KEYS` | _(empty)_ | comma-separated; `/health`, `/metrics`, `/v1/models` stay open |
+| `GATEWAY_API_KEYS` | _(empty)_ | comma-separated; `/health`, `/metrics`, `/v1/models` stay open. A key may carry a routing policy after `=`: `"k1,k2=local_only,k3=fast"`. Policies are `auto` (default), `local_only`, or a tier name. An unrecognised policy **refuses startup** rather than defaulting to `auto` |
 | `GATEWAY_RATE_LIMIT_ENABLED` | `false` | **off by default** |
 | `GATEWAY_MAX_REQUESTS_PER_MINUTE` | `60` | per key, fixed window |
 | `GATEWAY_MAX_TOKENS_PER_MINUTE` | `10000` | charged upfront from `max_tokens` |

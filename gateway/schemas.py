@@ -14,6 +14,17 @@ class StreamOptions(BaseModel):
     include_usage: bool = False
 
 
+class RoutingRequest(BaseModel):
+    """Explicit routing instructions from the client.
+
+    Naming a tier is the second way to be explicit about where a request goes; the
+    first is naming a model. A tier is the better handle when you want "the expensive
+    one" without pinning the exact model behind it.
+    """
+
+    tier: Optional[str] = None
+
+
 class ChatCompletionRequest(BaseModel):
     # Optional. Absent, or the sentinel "auto", asks the gateway to route by prompt
     # content. Any other value names a model and is honoured as-is — never re-routed.
@@ -27,6 +38,7 @@ class ChatCompletionRequest(BaseModel):
     # backend reports exact counts and chunk-counting is approximate. Send it
     # explicitly to get OpenAI's behaviour either way.
     stream_options: Optional[StreamOptions] = None
+    routing: Optional[RoutingRequest] = None
 
 
 class ChatCompletionChoice(BaseModel):

@@ -14,6 +14,8 @@ import pytest
 from prometheus_client import REGISTRY
 
 from gateway import main
+from gateway.config import TierConfig
+from gateway.router import Route
 from gateway.schemas import ChatCompletionRequest, ChatMessage
 
 
@@ -51,10 +53,21 @@ def req(model: str = "fake-model") -> ChatCompletionRequest:
     )
 
 
+def route_for(model: str, kind: str = "fake") -> Route:
+    """A single-entry route, which is what every test here wants: no fallback."""
+    return Route(tier="fast", model=model, kind=kind, explicit=False,
+                 chain=(TierConfig(kind, model),))
+
+
 @pytest.fixture
 def fake_backend():
-    """The backend is passed into _stream_response, so no patching is needed."""
-    return FakeBackend()
+    """Registered in the registry, since _stream_response resolves backends by kind."""
+    fake = FakeBackend()
+    main._backends["fake"] = fake
+    try:
+        yield fake
+    finally:
+        main._backends.pop("fake", None)
 
 
 def test_disconnect_closes_backend_and_counts_once(fake_backend):
@@ -65,7 +78,7 @@ async def _disconnect_closes_backend(fake_backend):
     model = "cancel-test"
     before = cancelled_count(model)
 
-    resp = await main._stream_response(req(model), "fast", 0.0, fake_backend, "fake")
+    resp, _used = await main._stream_response(req(model), "fast", 0.0, route_for(model))
     body = resp.body_iterator
 
     # Read a couple of chunks, as a client would, then hang up.
@@ -90,7 +103,7 @@ async def _disconnect_releases_slot(fake_backend):
     """
     slots_before = main._queue._value
 
-    resp = await main._stream_response(req("slot-test"), "fast", 0.0, fake_backend, "fake")
+    resp, _used = await main._stream_response(req("slot-test"), "fast", 0.0, route_for("slot-test"))
     body = resp.body_iterator
     await body.__anext__()
     assert main._queue._value == slots_before - 1, "slot was not taken"
@@ -118,11 +131,13 @@ async def _completed_not_cancelled():
                 self.closed = True
 
     fake = FiniteBackend()
+    main._backends["fake"] = fake
     model = "complete-test"
     before = cancelled_count(model)
 
-    resp = await main._stream_response(req(model), "fast", 0.0, fake, "fake")
+    resp, _used = await main._stream_response(req(model), "fast", 0.0, route_for(model))
     chunks = [chunk async for chunk in resp.body_iterator]
 
     assert any("[DONE]" in c for c in chunks)
     assert cancelled_count(model) == before, "a completed stream was counted as cancelled"
+    main._backends.pop("fake", None)

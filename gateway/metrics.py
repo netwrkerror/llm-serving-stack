@@ -51,6 +51,14 @@ REQUESTS_CANCELLED = Counter(
     ["model"],
 )
 
+FALLBACKS = Counter(
+    "llm_fallbacks_total",
+    "Times a tier's next backend was tried after the previous one failed. Only ever "
+    "incremented before the first chunk reaches the client; after that a failure is an "
+    "in-band error chunk and cannot be retried",
+    ["tier", "from_kind", "to_kind", "reason"],
+)
+
 THROUGHPUT = Histogram(
     "llm_tokens_per_second",
     "Tokens generated per second",

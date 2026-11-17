@@ -433,3 +433,86 @@ count per prompt per cell**, alongside the pass/fail. Without it, a tier differe
 template difference are indistinguishable after the fact, and the only way to tell them
 apart is to re-run everything. With it, "did the 70B do better, or did it just receive a
 different prompt" is answerable from the saved records.
+
+## Stage 3 — policy routing and fallback (2026-11-16)
+
+**The precedence table, as it ended up:**
+
+| Order | Source | Beats | Under `local_only`, if it resolves to a non-local backend |
+|-------|--------|-------|-----------------------------------------------------------|
+| 1 | a named `model` | everything | **403** — never re-routed, so refused instead |
+| 2 | `routing.tier` | the policy, classify() | **403** |
+| 3 | the key's policy, when it names a tier | classify() | **403** |
+| 4 | `classify()` | — | **downgraded** to the nearest local tier, logged |
+
+Two things in that table are decisions rather than consequences, and both could have
+gone the other way:
+
+*`routing.tier` beats a tier policy.* So a key whose policy is `fast` can still ask for
+`powerful`. That makes a tier policy a **default, not a cap** — which is the right
+reading of "then the policy" in the precedence, but it means a tier policy is not a
+spend control. `local_only` is the spend control, and it is deliberately not
+expressible as a tier so it cannot be overridden the same way.
+
+*Automatic routing is downgraded, everything else is refused.* The asymmetry is the
+point: automatic routing was never promised a particular tier, so rewriting it keeps
+faith with the client. An explicit request was promised exactly what it asked for, so
+the honest answer is 403 with the tier and the policy named. Silently serving a cheaper
+tier would be the quality-side mirror of the paid-backend leak — and the harder one to
+notice, because nothing fails, the answers just get worse.
+
+*The downgrade goes down, not sideways.* `_first_local_tier` walks from the requested
+tier **downwards** through `fast → balanced → powerful`, so a blocked `powerful` becomes
+`balanced` if that is local, not `fast`. A downgrade should cost capability, never add
+it.
+
+**A misspelt policy refuses startup.** `GATEWAY_API_KEYS="k=localonly"` raises rather
+than defaulting to `auto`, because defaulting would hand that key exactly the paid
+backends it was configured not to reach, and nothing downstream would look wrong. This
+is the one place in the gateway that refuses to boot on bad config, and it earns it.
+
+**Policies live on the key, after an `=`.** `GATEWAY_API_KEYS="k1,k2=local_only"`.
+`=` rather than `:` because `:` already separates kind from model everywhere else, and a
+key is far more likely to contain a colon than an equals sign. Part 1's plain
+comma-separated list still parses, every entry defaulting to `auto`.
+
+**Policy is `auto` whenever auth is off**, which is the shipped default. A policy
+attached to an unauthenticated caller is theatre: anyone could choose their own by
+omitting the header.
+
+### What surprised me about fallback
+
+**The specified 10 s kill measured nothing, twice, and looked like a clean result.**
+Both repeats reported 24/24 succeeded and zero fallbacks. Nothing in that output says
+"your kill was too late" — it reads exactly like "fallback never fired", and if I had
+stopped there I would have written up a broken mechanism as a working one, or a working
+one as broken, with equal confidence. The giveaway was the loader printing `wall 10.18s`
+next to `killed at +10.17s`. The run is kept, and the loader now prints
+`kill landed mid-run: yes/no` precisely so this cannot be read past again. The cause is
+mundane: `max_tokens=400` does not mean 400 tokens, it means *up to* 400, and these
+prompts finish in ~60.
+
+**`bench.py` could not answer the question.** It records latency but not which backend
+served each request, so "p50 of fallen-back requests vs normal" is unanswerable from it.
+That is why `fallback_load.py` exists: it records `X-Routed-Backend` per request and
+kills the primary itself, so the kill is correlated with the requests rather than raced
+against them by a background `sleep`.
+
+**The post-first-byte case produced better evidence than a dedicated test would have.**
+I expected to have to construct a case where a request fails mid-stream. The kill
+produced 6 of them for free (4 and 2), and they are unambiguous: HTTP 200, a recorded
+TTFT of 0.19–0.34 s, then an in-band `incomplete chunked read`, and **not one of them
+fell back**. `llm_fallbacks_total` moved by exactly the count of requests with no TTFT
+yet. That is the invariant stated as a measurement rather than as a comment.
+
+**Falling back is cheap here, and that number is the least trustworthy one in the
+table.** +0.52 s and +0.19 s on p50 across two repeats — a refused connection plus a
+second prefill, between two servers on one machine. The between-repeat spread is larger
+than the effect. The number worth having is the remote one, and it is untested.
+
+**Unsure / flagged:** there is no timeout-triggered fallback. A backend that is *slow*
+rather than dead will hold the request until `request_timeout` (120 s) and only then
+fall back, which at that point is far past useful. A per-attempt budget shorter than the
+whole-request timeout is the obvious fix and is not implemented. Also untested: fallback
+across a real network partition, and policy routing under load — the `local_only` tests
+are all unit-level.
