@@ -50,10 +50,48 @@ Each prompt carries one of:
 - `json` — parsed and compared to `expect`. A fenced ```json block is tolerated, because
   small models add one even when told not to; anything beyond that counts as not
   following the instruction.
-- `rubric` — **not graded by the runner.** Recorded with the completion and counted in
-  its own column for a human or a separate judge. A rubric prompt can therefore never
-  silently inflate a pass rate, which is what would happen if the runner guessed.
+- `rubric` — **not graded by the runner.** Recorded with the completion for a human to
+  grade. A rubric prompt can therefore never silently inflate a pass rate, which is what
+  would happen if the runner guessed.
 
-Rubric prompts are 8 of the 10 reasoning prompts, so the graded reasoning column is only
-2 prompts wide. That is a real limitation of these numbers, not a rounding detail: treat
-the reasoning rate as indicative at best until the rubrics are graded.
+## Hand grades
+
+`eval/grades.jsonl` holds the human grades, one line per (prompt, tier, dimension):
+
+| dimension | applies to | question |
+|-----------|-----------|----------|
+| `rubric` | the 8 reasoning rubrics | does the answer contain what the rubric names? |
+| `content` | all 10 code prompts | is the substantive answer right? |
+| `format` | all 10 code prompts | did it obey "output only ..."? |
+
+**Grader: Claude Opus 5, by hand**, named in every line. Each completion was read and
+decided one at a time against the rubric, with the reason recorded. **No model was used
+as a judge** — not even for a first pass — because a model grading its own family's
+output produces a number that looks like evidence and is not.
+
+Every grade carries the `sha256` of the completion it was made against.
+
+```bash
+python3 eval/report.py --run benchmark/out/run-eval-<hash>-<ts>
+```
+
+merges the grades into the mechanical results and **verifies those hashes**, reporting
+any grade whose completion has changed as stale rather than counting it. A grade silently
+attached to a different completion is worse than no grade at all. `report.py` exits
+non-zero if any grade is stale.
+
+Splitting code into `content` and `format` matters: a single mechanical column mixes "is
+the answer right" with "did it do as it was told", and so attributes every failure to
+capability. See the correction in `benchmark/RESULTS.md` — hand-grading reversed the
+code finding, and two of the mechanical failures turned out to be bugs in the checks.
+
+## The adversarial set
+
+`eval/prompts-adversarial.jsonl` — five short prompts built from the substring-containment
+false positives pinned in `tests/test_router.py` ("analyzer" matching "analyze"). It
+exists because the 30-prompt set does **not** exercise that failure mode, so a `0` in the
+`powerful` column there is not evidence the heuristic is safe.
+
+These are routed through `classify()` only, never through a model, and reported as their
+own table. **Never merge them into the 30-prompt results**: the committed set stays as it
+was measured.

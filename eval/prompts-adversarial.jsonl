@@ -1,0 +1,5 @@
+{"id": "adv-01", "category": "adversarial", "prompt": "build me an analyzer", "trips": "analyze", "note": "substring of 'analyze' inside 'analyzer'"}
+{"id": "adv-02", "category": "adversarial", "prompt": "the designer left early", "trips": "design", "note": "substring of 'design' inside 'designer'"}
+{"id": "adv-03", "category": "adversarial", "prompt": "the signal analyzer is cheap", "trips": "analyze", "note": "same, in a sentence with no analytical intent"}
+{"id": "adv-04", "category": "adversarial", "prompt": "who implemented the lift", "trips": "implement", "note": "substring of 'implement' inside 'implemented'"}
+{"id": "adv-05", "category": "adversarial", "prompt": "is the debugger free", "trips": "debug", "note": "substring of 'debug' inside 'debugger'"}
