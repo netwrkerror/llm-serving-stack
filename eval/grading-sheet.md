@@ -32,8 +32,8 @@ A semaphore that caps in-flight requests prevents the model from batching by lim
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `FAIL   ` &nbsp; <!-- PASS or FAIL -->
+- reason: ` Says the semaphore prevents batchin; doesn't connect with backend/engine's decision                         `
 
 ### reason-03 · fast · `llama3.2:1b` · rubric
 
@@ -49,8 +49,8 @@ A semaphore that caps in-flight requests prevents it from making batches, as the
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `    FAIL     ` &nbsp; <!-- PASS or FAIL -->
+- reason: `  wrong claim;the semaphore stops batches from forming        `
 
 ### reason-04 · balanced · `llama3.1:8b` · rubric
 
@@ -66,8 +66,8 @@ The large gap between a p50 latency of 100ms and a p99 latency of 4 seconds sugg
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: ` PASS               ` &nbsp; <!-- PASS or FAIL -->
+- reason: ` Long tail from contention that is - only occasionally triggered    `
 
 ### reason-04 · fast · `llama3.2:1b` · rubric
 
@@ -83,8 +83,8 @@ The significant gap between the measured p50 latency of 100ms and the p99 latenc
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `   FAIL   ` &nbsp; <!-- PASS or FAIL -->
+- reason: `  reads the gap as high-priority work, not a tail     `
 
 ### reason-05 · balanced · `llama3.1:8b` · rubric
 
@@ -100,8 +100,8 @@ Retrying a failed request against a second paid provider can be cheaper than ret
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `  FAIL   ` &nbsp; <!-- PASS or FAIL -->
+- reason: `  says retrying is wasted on a provider infra failure, which is exactly when retrying helps; never names request-side errors      `
 
 ### reason-05 · fast · `llama3.2:1b` · rubric
 
@@ -117,8 +117,8 @@ It's generally more cost-effective to return the error rather than retrying a fa
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `  FAIL         ` &nbsp; <!-- PASS or FAIL -->
+- reason: `       naver names a case where retrying is wasted            `
 
 ### reason-06 · balanced · `llama3.1:8b` · rubric
 
@@ -134,8 +134,8 @@ Time-to-first-token can be high because it measures the delay between a request 
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: ` PASS   ` &nbsp; <!-- PASS or FAIL -->
+- reason: `   separates the delay before the first token from the rate once tokens arrive   `
 
 ### reason-06 · fast · `llama3.2:1b` · rubric
 
@@ -151,8 +151,8 @@ Time-to-first-token (TTF) can be high due to the overhead of tokenization, where
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `       FAIL ` &nbsp; <!-- PASS or FAIL -->
+- reason: `     blames tokenization overhead; never mentions throughput  `
 
 ### reason-07 · balanced · `llama3.1:8b` · rubric
 
@@ -168,8 +168,8 @@ One plausible cause is that the 1B model uses a more aggressive truncation strat
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `        FAIL        ` &nbsp; <!-- PASS or FAIL -->
+- reason: `          Blames truncation strategy, not the template or tokenizer.             `
 
 ### reason-07 · fast · `llama3.2:1b` · rubric
 
@@ -185,8 +185,8 @@ One plausible cause for the difference in prompt token counts between the 1B and
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `    FAIL            ` &nbsp; <!-- PASS or FAIL -->
+- reason: `   blames model capacity                                      `
 
 ### reason-08 · balanced · `llama3.1:8b` · rubric
 
@@ -202,8 +202,8 @@ The server may continue to generate new content or data even after a client disc
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `    FAIL   ` &nbsp; <!-- PASS or FAIL -->
+- reason: `        Invents a scheduling mechanism; nothing about the disconnect going unnoticed or the upstream not being cancelled    `
 
 ### reason-08 · fast · `llama3.2:1b` · rubric
 
@@ -219,8 +219,8 @@ The server may continue to generate content because it has already sent the init
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `     FAIL ` &nbsp; <!-- PASS or FAIL -->
+- reason: `    Treats the disconnect as an acknowledgement      `
 
 ### reason-09 · balanced · `llama3.1:8b` · rubric
 
@@ -236,8 +236,8 @@ A token is a single unit of text, such as a punctuation mark or a space, whereas
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `my verdict could have been FAIL; however since it mentioned that word is a sequence of tokens that forms a meaningful unit... I passed it based on reasoning`
 
 ### reason-09 · fast · `llama3.2:1b` · rubric
 
@@ -253,8 +253,8 @@ A token is a unit of meaning or a symbol that represents a word, phrase, or conc
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `FAIL` &nbsp; <!-- PASS or FAIL -->
+- reason: `Defines a token as a unit of meaning`
 
 ### reason-10 · balanced · `llama3.1:8b` · rubric
 
@@ -270,8 +270,8 @@ The two scenarios cost the same to serve, as they both require serving 10,000 ou
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `passing it as it's a loaded question on serving cost; answers equal at 10,000 output tokens`
 
 ### reason-10 · fast · `llama3.2:1b` · rubric
 
@@ -287,8 +287,8 @@ To determine which option costs more to serve, we need to calculate the total co
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `FAIL` &nbsp; <!-- PASS or FAIL -->
+- reason: `lol made up $10,000 vs $1,000,000 for equal totals`
 
 ---
 
@@ -311,8 +311,8 @@ To determine which option costs more to serve, we need to calculate the total co
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `range(1,6) comprehension`
 
 ### code-01 · fast · `llama3.2:1b` · content
 
@@ -331,8 +331,8 @@ To determine which option costs more to serve, we need to calculate the total co
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `FAIL` &nbsp; <!-- PASS or FAIL -->
+- reason: `a literal list, not a comprehension`
 
 ### code-02 · balanced · `llama3.1:8b` · content
 
@@ -352,8 +352,8 @@ def add(a: int, b: int) -> int:
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `right signature; pass is the minimum Python allows*`
 
 ### code-02 · fast · `llama3.2:1b` · content
 
@@ -376,8 +376,8 @@ Note: In Python 3.8+, you can use the built-in `Add` class from the `typing` mod
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `FAIL` &nbsp; <!-- PASS or FAIL -->
+- reason: `from typing import Add doesn't exist, so the code doesn't import`
 
 ### code-03 · balanced · `llama3.1:8b` · content
 
@@ -417,8 +417,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `the code produces the right object`
 
 ### code-03 · fast · `llama3.2:1b` · content
 
@@ -440,8 +440,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `right object; clever compared to balanced which wrote the python script to generate the object`
 
 ### code-04 · balanced · `llama3.1:8b` · content
 
@@ -458,8 +458,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `-L`
 
 ### code-04 · fast · `llama3.2:1b` · content
 
@@ -476,8 +476,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `FAIL` &nbsp; <!-- PASS or FAIL -->
+- reason: `--r is not a curl flag`
 
 ### code-05 · balanced · `llama3.1:8b` · content
 
@@ -494,7 +494,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-05 · fast · `llama3.2:1b` · content
@@ -514,7 +514,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-06 · balanced · `llama3.1:8b` · content
@@ -532,8 +532,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `\d{4} without ^…$ also matches inside "12345". Both tiers gave the same answer, so it can't change the tier comparison. It only changes both totals by one.`
 
 ### code-06 · fast · `llama3.2:1b` · content
 
@@ -552,8 +552,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `\d{4} without ^…$ also matches inside "12345". Both tiers gave the same answer, so it can't change the tier comparison. It only changes both totals by one.`
 
 ### code-07 · balanced · `llama3.1:8b` · content
 
@@ -572,7 +572,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `       PASS         ` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-07 · fast · `llama3.2:1b` · content
@@ -596,7 +596,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-08 · balanced · `llama3.1:8b` · content
@@ -614,8 +614,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `--format=oneline prints one line per commit`
 
 ### code-08 · fast · `llama3.2:1b` · content
 
@@ -632,8 +632,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `passing it; --format=%s prints one line per commit (subject only)`
 
 ### code-09 · balanced · `llama3.1:8b` · content
 
@@ -650,8 +650,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `environ.get('PORT','8000'), int-cast`
 
 ### code-09 · fast · `llama3.2:1b` · content
 
@@ -672,8 +672,8 @@ print(os.environ.get('PORT', '8000'))
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `same read; wrapped in print`
 
 ### code-10 · balanced · `llama3.1:8b` · content
 
@@ -707,8 +707,8 @@ Note: The `json.dumps()` function is used to convert a Python object into a JSON
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `the code yields {"ok":true}`
 
 ### code-10 · fast · `llama3.2:1b` · content
 
@@ -729,7 +729,7 @@ Note: The `json.dumps()` function is used to convert a Python object into a JSON
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ---
@@ -753,7 +753,7 @@ Note: The `json.dumps()` function is used to convert a Python object into a JSON
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-01 · fast · `llama3.2:1b` · format
@@ -773,7 +773,7 @@ Note: The `json.dumps()` function is used to convert a Python object into a JSON
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-02 · balanced · `llama3.1:8b` · format
@@ -794,7 +794,7 @@ def add(a: int, b: int) -> int:
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-02 · fast · `llama3.2:1b` · format
@@ -818,8 +818,8 @@ Note: In Python 3.8+, you can use the built-in `Add` class from the `typing` mod
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `FAIL` &nbsp; <!-- PASS or FAIL -->
+- reason: `prose "Note:" after the code`
 
 ### code-03 · balanced · `llama3.1:8b` · format
 
@@ -859,8 +859,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `FAIL` &nbsp; <!-- PASS or FAIL -->
+- reason: `Python program, not JSON`
 
 ### code-03 · fast · `llama3.2:1b` · format
 
@@ -882,7 +882,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-04 · balanced · `llama3.1:8b` · format
@@ -900,7 +900,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-04 · fast · `llama3.2:1b` · format
@@ -918,8 +918,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: `(only a flag, a wrong one)`
 
 ### code-05 · balanced · `llama3.1:8b` · format
 
@@ -936,7 +936,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-05 · fast · `llama3.2:1b` · format
@@ -956,7 +956,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-06 · balanced · `llama3.1:8b` · format
@@ -974,7 +974,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-06 · fast · `llama3.2:1b` · format
@@ -994,7 +994,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-07 · balanced · `llama3.1:8b` · format
@@ -1014,7 +1014,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-07 · fast · `llama3.2:1b` · format
@@ -1038,7 +1038,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-08 · balanced · `llama3.1:8b` · format
@@ -1056,7 +1056,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-08 · fast · `llama3.2:1b` · format
@@ -1074,7 +1074,7 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-09 · balanced · `llama3.1:8b` · format
@@ -1092,8 +1092,8 @@ print(return_json())
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
+- reason: ``
 
 ### code-09 · fast · `llama3.2:1b` · format
 
@@ -1114,7 +1114,7 @@ print(os.environ.get('PORT', '8000'))
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ### code-10 · balanced · `llama3.1:8b` · format
@@ -1149,8 +1149,8 @@ Note: The `json.dumps()` function is used to convert a Python object into a JSON
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
-- reason: `                                                                `
+- [ ] verdict: `FAIL` &nbsp; <!-- PASS or FAIL -->
+- reason: `prose plus Python`
 
 ### code-10 · fast · `llama3.2:1b` · format
 
@@ -1171,7 +1171,7 @@ Note: The `json.dumps()` function is used to convert a Python object into a JSON
 
 </details>
 
-- [ ] verdict: `                ` &nbsp; <!-- PASS or FAIL -->
+- [ ] verdict: `PASS` &nbsp; <!-- PASS or FAIL -->
 - reason: `                                                                `
 
 ---

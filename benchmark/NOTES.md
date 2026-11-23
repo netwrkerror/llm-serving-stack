@@ -655,3 +655,25 @@ start; the runner does all of one tier then the next, and Ollama evicted the 1B 
 configuration, but **nobody should rely on the ordering**: it is the scheduler's eviction
 policy, not an arrangement the eval makes or asserts. If a future run needs the 8B alone,
 make it so explicitly rather than assuming this repeats.
+
+**Grading went to two graders, and the session's column lost the one disagreement.**
+Author and session agreed on 55 of 56. The exception is `code-02` [fast] content: the
+model emitted `from typing import Add` — which does not exist — above a correct function
+signature. The session passed it on the grounds that the requested artifact (the
+signature) was right. The author failed it: the prompt asked for code, and code that
+raises `ImportError` on line one is not correct code. The author's reading is the result
+and is the better one.
+
+Worth noting *why* the session got it wrong, because the mechanical check got it wrong
+the same way: both graded the fragment the prompt named and ignored the rest of what was
+emitted. The regex looked for the signature and never saw the broken import; I did the
+same thing in prose. A narrow question asked twice gives the same wrong answer twice, and
+two sources agreeing is not corroboration when they share the error.
+
+**And the sentence I was asked to add turned out to be false.** The review asked for "the
+mechanical column understates both tiers" next to the quality table. The author's grades
+do not support it: the checks understate `balanced` by 2, but for `fast` they are wrong
+twice in opposite directions — a false FAIL on `code-08` and a false pass on `code-02` —
+and land on 7/10 either way. A check that is wrong twice and right in total is worse than
+one that is simply wrong, because nothing in the number invites a second look. RESULTS now
+says "wrong in four places, in both directions" instead.

@@ -36,9 +36,11 @@ eval is about answers rather than throughput.
 
 ### Pass counts per category per tier
 
-**Read this before the numbers: the mechanical column understates both tiers.** Two of
-the committed code checks reject correct answers — see the correction below — so the
-regex/json pass counts are a floor, not a measurement of capability.
+**Read this before the numbers: the mechanical column is wrong in four places, in both
+directions.** Three of its verdicts reject correct answers and one accepts a broken one,
+so the regex/json pass counts are not a measurement of capability — and for one tier they
+land on the right total only because two errors cancel. The table below is the hand
+grades, not the checks.
 
 Reasoning is **10 wide**: the 8 rubric prompts are hand-graded for both tiers. Grading is
 **by the author**, with an independent pass by Claude in the working session reported
@@ -48,13 +50,11 @@ the result. Every grade is in `eval/grades.jsonl` with the sha256 of the complet
 made against and a one-sentence reason; `eval/report.py` verifies those hashes and refuses
 to count a grade whose completion has changed.
 
-> **The numbers in the table below are the `claude-session` column.** They are replaced
-> by the author's grades once those are filled in, and the conditions block then carries
-> the agreement count. Pending.
+The two graders **agreed on 55 of 56 items**. The single disagreement is listed below.
 
 | tier | model | factual | reasoning | code: content | code: format |
 |------|-------|---------|-----------|---------------|--------------|
-| `fast` | `llama3.2:1b` | 6/10 (60%) | **0/10 (0%)** | 8/10 | 9/10 |
+| `fast` | `llama3.2:1b` | 6/10 (60%) | **0/10 (0%)** | 7/10 | 9/10 |
 | `balanced` | `llama3.1:8b` | 9/10 (90%) | **5/10 (50%)** | **10/10** | 8/10 |
 
 Reasoning breaks down as mechanical 0/2 + rubric 0/8 for `fast`, and mechanical 1/2 +
@@ -65,29 +65,47 @@ arithmetic for two equal token totals, and answered the prompt-token question wi
 
 **No blended score.** The categories are not commensurable.
 
-#### Correction to the earlier code column
+#### Where the mechanical checks and the graders disagree
 
-An earlier version of this section reported code as "fast 7/10, balanced 6/10" from the
-mechanical checks alone and concluded **"the 8B is better on facts and worse on code"**.
-Hand-grading reverses that: on content the 8B is **10/10 against the 1B's 8/10** —
-strictly better, and perfect. It loses only on *following the output instruction*, 8/10
-against 9/10.
+An earlier version of this section reported code from the mechanical checks alone —
+"fast 7/10, balanced 6/10" — and concluded **"the 8B is better on facts and worse on
+code"**. Hand-grading does not support that. On content the 8B is **10/10 against the
+1B's 7/10**: strictly better, and perfect. It loses only on *following the output
+instruction*, 8/10 against 9/10.
 
-The mechanical column was conflating two different things, and two of the 8B's four
-mechanical failures are not the model being wrong at all:
+The mechanical column disagrees with the graders on four cells, and **not all in the
+same direction**:
 
-| prompt | tier | mechanical | what actually happened |
-|--------|------|-----------|------------------------|
-| `code-03` | balanced | FAIL | Knew the object; returned a Python function that builds it instead of the JSON. **Real format failure.** |
-| `code-10` | balanced | FAIL | Same, plus a prose preamble. **Real format failure.** |
-| `code-04` | balanced | FAIL | Answered `` `-L` ``, which is correct. The regex required `-L` preceded by whitespace or start of string, and a backtick is neither. **Check artifact.** |
-| `code-08` | balanced | FAIL | Answered `git log --format=oneline`, which genuinely prints one line per commit. The regex required the literal `--oneline`. **Check artifact — the check is too narrow.** |
+| prompt | tier | check | graders | what actually happened |
+|--------|------|-------|---------|------------------------|
+| `code-08` | fast | FAIL | pass | `git log --format=%s` prints one line per commit. The regex demanded the literal `--oneline`. **Check too narrow.** |
+| `code-08` | balanced | FAIL | pass | `git log --format=oneline` likewise. **Check too narrow.** |
+| `code-04` | balanced | FAIL | pass | Answered `` `-L` ``, correct. The regex required whitespace before the flag and a backtick is neither. **Check artifact.** |
+| `code-02` | fast | **pass** | **FAIL** | Emitted `from typing import Add`, which does not exist, so the code does not import. The regex only looked for the signature and never saw the broken line. **Check too generous.** |
 
-`code-08` fails the same way on `fast` (`git log --format=%s`, also one line per commit),
-so the mechanical code column understates **both** tiers. The checks are left exactly as
-committed at `1bad7ca` rather than loosened after seeing the results; the per-prompt
-reasons in `grades.jsonl` are the record of where they are wrong, and a future set should
-fix `code-04` and `code-08` before measuring anything else with them.
+**For `fast` the two errors cancel.** Mechanical says 7/10 and content+format-both-pass is
+also 7/10 — the same number reached by one false failure and one false pass. A check that
+is wrong twice and right in total is the worst case for anyone reading the number alone.
+For `balanced` the checks understate by 2 (`code-04`, `code-08`), with no compensating
+error.
+
+The checks are left exactly as committed at `1bad7ca` rather than loosened after seeing
+results; `grades.jsonl` is the record of where they are wrong, and a future set should fix
+`code-02`, `code-04` and `code-08` before measuring anything else with them.
+
+#### The one disagreement between graders
+
+`code-02` [fast], content — **author: FAIL, session: pass.**
+
+- author: *"from typing import Add doesn't exist, so the code doesn't import"*
+- session: *"The requested signature is correct, body omitted."*
+
+The author's reading is the recorded result, and is the better one: the prompt asked for
+code, and code that raises `ImportError` on its first line is not correct code however
+right the signature below it is. The session graded the artifact asked for and ignored
+the rest of what was emitted — a narrower question than the one the prompt poses. This is
+also the cell where the mechanical check is too generous, for exactly the same reason, so
+the narrow reading was wrong twice independently.
 
 ### Prompt tokens per cell
 
