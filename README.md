@@ -291,6 +291,8 @@ All three signals, correlated: a log line carries the `trace_id` of its trace.
 | `llm_fallbacks_total` | Times a tier's next backend was tried after the previous failed. Labelled by `tier`, `from_kind`, `to_kind`, `reason`. Only ever incremented **before** the first chunk reaches the client |
 | `llm_policy_downgrades_total` | Automatic routes rewritten to a cheaper tier by `local_only`. Labelled by `from_tier`, `to_tier`; `X-Model-Tier` reports the tier that served the request |
 
+Every request carries a `req_id`, returned as `X-Request-Id` and present on every log line for that request — including `slot_acquired` (when it left the queue), `backend_stream_closed` (how long `aclose()` took) and `request_cancelled`. `/health` returns `now_ms`, the server's own wall clock, so a caller can measure the offset between its clock and the gateway's rather than assume it is zero.
+
 ### Trace spans
 
 Each request produces three spans: `llm.request` wraps `llm.queue.wait` (time to acquire

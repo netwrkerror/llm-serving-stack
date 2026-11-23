@@ -200,6 +200,11 @@ async def health():
             checks[kind] = False
     return {
         "status": "ok" if checks and all(checks.values()) else "degraded",
+        # The server's own wall clock. Lets a caller measure the offset between its
+        # clock and this process's — needed whenever gateway timestamps are lined up
+        # against events observed elsewhere, and the gateway may be in a VM whose
+        # clock is not the host's.
+        "now_ms": _now_ms(),
         "backend": settings.backend_url,
         "backend_kind": settings.backend,
         "backends": checks,
@@ -256,6 +261,10 @@ async def prometheus_metrics():
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     arrival = time.perf_counter()
+    # Correlates every log line for one request. Without it, two concurrent requests
+    # for the same model are indistinguishable in the log, which is exactly the case
+    # the queued-disconnect experiment has to take apart.
+    req_id = uuid.uuid4().hex[:8]
     api_key = api_key_from(request)
 
     allowed, reason = rate_limiter.check_request(api_key)
@@ -287,6 +296,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     req = req.model_copy(update={"model": routed_model})
 
     log.info("request_received", extra={
+        "req_id": req_id,
+        "arrived_at_ms": _now_ms(),
         "model": routed_model,
         "tier": tier,
         "backend_kind": route.kind,
@@ -308,12 +319,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         })
 
     if req.stream:
-        resp, used = await _stream_response(req, tier, arrival, route)
+        resp, used = await _stream_response(req, tier, arrival, route, req_id)
     else:
         # JSONResponse rather than the Pydantic model directly, so the headers below
         # apply to both paths.
         try:
-            body, used = await _sync_response(req, tier, arrival, route)
+            body, used = await _sync_response(req, tier, arrival, route, req_id)
             resp = JSONResponse(content=body.model_dump())
         except _UpstreamFailure as fail:
             resp = _openai_error(fail.status, fail.message, fail.err_type)
@@ -324,16 +335,40 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     resp.headers["X-Routed-Model"] = used.model
     resp.headers["X-Routed-Backend"] = used.kind
     resp.headers["X-Routing-Policy"] = policy
+    resp.headers["X-Request-Id"] = req_id
     return resp
 
 
-async def _acquire_slot(model: str) -> None:
-    """Wait for a queue slot, counting this request as queued while it blocks."""
+def _now_ms() -> float:
+    """Wall-clock milliseconds, for timestamps that are compared across processes.
+
+    Deliberately not perf_counter: a monotonic clock is only meaningful inside one
+    process, and these events are lined up against a client on the host and an Ollama
+    log stamped by the harness. Wall clock is the only shared reference, and the
+    harness measures the offset rather than assuming it is zero.
+    """
+    return time.time() * 1000.0
+
+
+async def _acquire_slot(model: str, req_id: str = "") -> None:
+    """Wait for a queue slot, counting this request as queued while it blocks.
+
+    Logs the moment the slot is granted. That instant is the end of the llm.queue.wait
+    span, so a request queued behind another is admitted exactly here — which is the
+    event the queued-disconnect experiment measures against Ollama's own cancellation.
+    """
     QUEUE_WAITING.labels(model=model).inc()
+    waited_from = time.perf_counter()
     try:
         await _queue.acquire()
     finally:
         QUEUE_WAITING.labels(model=model).dec()
+    log.info("slot_acquired", extra={
+        "req_id": req_id,
+        "model": model,
+        "waited_ms": round((time.perf_counter() - waited_from) * 1000, 3),
+        "at_ms": _now_ms(),
+    })
 
 
 def _set_span_attrs(span, req: ChatCompletionRequest, tier: str, kind: str = "") -> None:
@@ -345,7 +380,7 @@ def _set_span_attrs(span, req: ChatCompletionRequest, tier: str, kind: str = "")
     span.set_attribute("llm.max_tokens", req.max_tokens or 512)
 
 
-def _record_backend_timings(span, timings: dict) -> None:
+def _record_backend_timings(span, timings: dict) -> dict:
     """Attach the backend's self-reported durations to the inference span.
 
     Only Ollama reports these; OpenAI-compatible backends send nothing, so skip quietly.
@@ -360,12 +395,18 @@ def _record_backend_timings(span, timings: dict) -> None:
     there is one place to keep them honest.
     """
     if not timings:
-        return
+        return {}
+    recorded = {}
     for name, value in timings.items():
-        span.set_attribute(f"ollama.{name}", round(value, 2))
+        recorded[name] = round(value, 2)
+        span.set_attribute(f"ollama.{name}", recorded[name])
     if "total_ms" in timings:
         phases = sum(timings.get(k, 0.0) for k in ("load_ms", "prompt_eval_ms", "eval_ms"))
-        span.set_attribute("ollama.unattributed_ms", round(timings["total_ms"] - phases, 2))
+        recorded["unattributed_ms"] = round(timings["total_ms"] - phases, 2)
+        span.set_attribute("ollama.unattributed_ms", recorded["unattributed_ms"])
+    # Returned as well as set on the span so it can be logged: reading one number back
+    # out of a trace is a lot of machinery for a value the request already has.
+    return recorded
 
 
 def _completion_tokens(meta: dict, delta_count: int) -> int:
@@ -505,7 +546,7 @@ async def _open_first_chunk(route: Route, req: ChatCompletionRequest, span):
 
 
 async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float,
-                           route: Route) -> tuple[Response, TierConfig]:
+                           route: Route, req_id: str = "") -> tuple[Response, TierConfig]:
     """Open the backend stream, falling back while that is still possible, and return
     a streaming response plus the backend that actually answered.
 
@@ -527,7 +568,7 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
     try:
         with otel_trace.use_span(span, end_on_exit=False):
             with t.start_as_current_span("llm.queue.wait"):
-                await _acquire_slot(model)
+                await _acquire_slot(model, req_id)
             acquired = True
             inf_span = t.start_span("llm.inference")
             with otel_trace.use_span(inf_span, end_on_exit=False):
@@ -605,13 +646,20 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
                                 # generation time drives throughput; end-to-end drives latency
                                 duration = time.perf_counter() - gen_start
                                 e2e = time.perf_counter() - arrival
-                                _record_backend_timings(inf_span, meta.get("timings", {}))
+                                ollama_timings = _record_backend_timings(
+                                    inf_span, meta.get("timings", {}))
                                 billed = _completion_tokens(meta, token_count)
                                 REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
                                 REQUEST_DURATION.labels(model=model, stream="true", status="success").observe(e2e)
                                 TOKENS_GENERATED.labels(model=model).inc(billed)
                                 THROUGHPUT.labels(model=model).observe(billed / duration if duration > 0 else 0)
                                 log.info("request_completed", extra={
+                                    "req_id": req_id,
+                                    "at_ms": _now_ms(),
+                                    "ollama_unattributed_ms": ollama_timings.get("unattributed_ms"),
+                                    "ollama_total_ms": ollama_timings.get("total_ms"),
+                                    "ollama_eval_ms": ollama_timings.get("eval_ms"),
+                                    "ollama_prompt_eval_ms": ollama_timings.get("prompt_eval_ms"),
                                     "model": model, "stream": True,
                                     "duration_s": round(e2e, 3),
                                     "generation_s": round(duration, 3),
@@ -695,17 +743,33 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
             #
             # Unconditional because the normal path has already exhausted agen, which
             # makes this a no-op there.
+            # Stamped before aclose so the ordering of "the finally began" against
+            # "the upstream was closed" is visible rather than inferred.
+            finally_at = _now_ms()
+            aclose_from = time.perf_counter()
             try:
                 await agen.aclose()
             except Exception as exc:  # never let cleanup mask the response
                 log.warning("backend_close_failed", extra={"model": model, "error": str(exc)})
+            aclose_ms = round((time.perf_counter() - aclose_from) * 1000, 3)
+            if outcome == "cancelled":
+                log.info("backend_stream_closed", extra={
+                    "req_id": req_id,
+                    "model": model,
+                    "finally_at_ms": finally_at,
+                    "at_ms": _now_ms(),
+                    "aclose_ms": aclose_ms,
+                })
 
             if outcome == "cancelled":
                 REQUESTS_CANCELLED.labels(model=model).inc()
                 log.info("request_cancelled", extra={
+                    "req_id": req_id,
                     "model": model,
                     "stream": True,
                     "duration_s": round(time.perf_counter() - arrival, 3),
+                    "finally_at_ms": finally_at,
+                    "at_ms": _now_ms(),
                     "tokens_sent": sent_tokens,
                 })
             span.set_attribute("llm.outcome", outcome)
@@ -755,7 +819,7 @@ async def _generate_with_fallback(route: Route, req: ChatCompletionRequest, span
 
 
 async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float,
-                         route: Route) -> tuple[ChatCompletionResponse, TierConfig]:
+                         route: Route, req_id: str = "") -> tuple[ChatCompletionResponse, TierConfig]:
     model = route.model
     kind = route.kind
     used = TierConfig(route.kind, route.model)
@@ -766,7 +830,7 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float,
             _set_span_attrs(span, req, tier, kind)
 
             with t.start_as_current_span("llm.queue.wait"):
-                await _acquire_slot(model)
+                await _acquire_slot(model, req_id)
             try:
                 with t.start_as_current_span("llm.inference") as inf_span:
                     start = time.perf_counter()
@@ -798,7 +862,7 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float,
                     # generation time drives throughput; end-to-end drives latency
                     duration = time.perf_counter() - start
                     e2e = time.perf_counter() - arrival
-                    _record_backend_timings(inf_span, meta.get("timings", {}))
+                    ollama_timings = _record_backend_timings(inf_span, meta.get("timings", {}))
                     span.set_attribute("llm.outcome", "completed")
                     inf_span.set_attribute("llm.outcome", "completed")
                     REQUEST_COUNT.labels(model=model, status="success", stream="false").inc()
@@ -806,6 +870,10 @@ async def _sync_response(req: ChatCompletionRequest, tier: str, arrival: float,
                     TOKENS_GENERATED.labels(model=model).inc(completion_tok)
                     THROUGHPUT.labels(model=model).observe(completion_tok / duration if duration > 0 else 0)
                     log.info("request_completed", extra={
+                        "req_id": req_id,
+                        "at_ms": _now_ms(),
+                        "ollama_unattributed_ms": ollama_timings.get("unattributed_ms"),
+                        "ollama_total_ms": ollama_timings.get("total_ms"),
                         "model": model, "stream": False,
                         "duration_s": round(e2e, 3),
                         "generation_s": round(duration, 3),
