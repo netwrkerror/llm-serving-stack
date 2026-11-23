@@ -608,3 +608,72 @@ is valid; neither column is comparable across repeats, and 0.953 s is not this m
 uncontended baseline — the single-server figure for the same model is 0.678 s. Noted in
 `RESULTS.md` next to the table, because a reader would otherwise reasonably read those
 two numbers as a trend.
+
+## Stage 4 follow-up — grading, and what the split revealed (2026-11-16)
+
+**Hand-grading reversed the code finding, and the earlier version was wrong in a way
+that sounded insightful.** I had written "the 8B is better on facts and worse on code"
+from the mechanical column, with a tidy explanation about chattier models failing
+format checks. On content the 8B is **10/10 against the 1B's 8/10** — strictly better,
+and perfect. It only loses on following the output instruction. Worse, two of its four
+mechanical failures are not the model at all: `code-04` answered `` `-L` `` and my regex
+required whitespace before the flag, and `code-08` answered `git log --format=oneline`,
+which genuinely prints one line per commit, while my regex demanded the literal
+`--oneline`. So the mechanical column understates both tiers, and the story I told about
+it was built on two of my own bugs. The checks stay as committed at `1bad7ca` — loosening
+them after seeing results is how an eval stops measuring anything — and `grades.jsonl`
+records where they are wrong.
+
+**The lesson generalises past this table:** a single mechanical column that mixes "is the
+answer right" with "did it do as it was told" will attribute every failure to capability,
+because that is the only story the number can tell.
+
+**The 1B scored zero on reasoning, all ten.** Not a narrow miss. It got p50-vs-p99
+backwards, invented $10,000-vs-$1,000,000 arithmetic for two equal token totals, and
+explained differing prompt-token counts with "the 8B generates more nuanced prompts". The
+router sends 4 of the 10 reasoning prompts to exactly this tier.
+
+**Grades carry the hash of what was graded, and `report.py` checks it.** A grade silently
+attached to a different completion is worse than no grade, because it looks like evidence.
+0 stale, 0 orphaned on this run. Grader is me, by hand, named in the file and in
+`eval/README.md`; no model-as-judge, so the reasoning column is a human opinion with its
+reasons written down rather than a model's opinion of its own output.
+
+**The adversarial set lands 5 of 5 on `powerful`** — four-word questions like "the
+designer left early" routing to the most expensive tier. Separate file, separate table,
+never merged into the 30-prompt results. Side by side with 0 of 30 genuine reasoning and
+code prompts reaching `powerful`, that is the finding in full: the heuristic is matching
+substrings, not reading intent.
+
+**Carry into the write-up:** on this workload the router has a tier it never uses — no
+prompt reached 120 words or matched a keyword — so the expensive tier's cost is set
+entirely by the keyword list, not by the workload.
+
+**The 8B ran alone by Ollama's choice, not by the runner's.** Nothing was resident at the
+start; the runner does all of one tier then the next, and Ollama evicted the 1B when the
+8B loaded (`api/ps` showed only `llama3.1:8b` afterwards). That is the cleaner
+configuration, but **nobody should rely on the ordering**: it is the scheduler's eviction
+policy, not an arrangement the eval makes or asserts. If a future run needs the 8B alone,
+make it so explicitly rather than assuming this repeats.
+
+**Grading went to two graders, and the session's column lost the one disagreement.**
+Author and session agreed on 55 of 56. The exception is `code-02` [fast] content: the
+model emitted `from typing import Add` — which does not exist — above a correct function
+signature. The session passed it on the grounds that the requested artifact (the
+signature) was right. The author failed it: the prompt asked for code, and code that
+raises `ImportError` on line one is not correct code. The author's reading is the result
+and is the better one.
+
+Worth noting *why* the session got it wrong, because the mechanical check got it wrong
+the same way: both graded the fragment the prompt named and ignored the rest of what was
+emitted. The regex looked for the signature and never saw the broken import; I did the
+same thing in prose. A narrow question asked twice gives the same wrong answer twice, and
+two sources agreeing is not corroboration when they share the error.
+
+**And the sentence I was asked to add turned out to be false.** The review asked for "the
+mechanical column understates both tiers" next to the quality table. The author's grades
+do not support it: the checks understate `balanced` by 2, but for `fast` they are wrong
+twice in opposite directions — a false FAIL on `code-08` and a false pass on `code-02` —
+and land on 7/10 either way. A check that is wrong twice and right in total is worse than
+one that is simply wrong, because nothing in the number invites a second look. RESULTS now
+says "wrong in four places, in both directions" instead.

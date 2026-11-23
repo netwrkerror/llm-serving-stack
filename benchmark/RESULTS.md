@@ -36,31 +36,76 @@ eval is about answers rather than throughput.
 
 ### Pass counts per category per tier
 
-Graded = mechanical checks only (exact / regex / json). Rubric prompts are recorded with
-their completions and **not graded by the runner**, so they can never inflate a rate.
+**Read this before the numbers: the mechanical column is wrong in four places, in both
+directions.** Three of its verdicts reject correct answers and one accepts a broken one,
+so the regex/json pass counts are not a measurement of capability — and for one tier they
+land on the right total only because two errors cancel. The table below is the hand
+grades, not the checks.
 
-| tier | model | category | graded | passed | rate | rubric (ungraded) |
-|------|-------|----------|--------|--------|------|-------------------|
-| `fast` | `llama3.2:1b` | factual | 10 | 6 | 60% | 0 |
-| `fast` | `llama3.2:1b` | reasoning | 2 | 0 | 0% | 8 |
-| `fast` | `llama3.2:1b` | code | 10 | 7 | 70% | 0 |
-| `balanced` | `llama3.1:8b` | factual | 10 | **9** | **90%** | 0 |
-| `balanced` | `llama3.1:8b` | reasoning | 2 | 1 | 50% | 8 |
-| `balanced` | `llama3.1:8b` | code | 10 | **6** | **60%** | 0 |
+Reasoning is **10 wide**: the 8 rubric prompts are hand-graded for both tiers. Grading is
+**by the author**, with an independent pass by Claude in the working session reported
+alongside and every disagreement listed. The session's pass is not independent of what is
+being measured — a model grading a model's output — which is why the author's column is
+the result. Every grade is in `eval/grades.jsonl` with the sha256 of the completion it was
+made against and a one-sentence reason; `eval/report.py` verifies those hashes and refuses
+to count a grade whose completion has changed.
 
-**No blended score is reported.** The categories are not commensurable, and 8 of the 10
-reasoning prompts are ungraded rubrics, so the graded reasoning column is two prompts
-wide — indicative at best.
+The two graders **agreed on 55 of 56 items**. The single disagreement is listed below.
 
-**The 8B is better on facts and worse on code**, which is the opposite of the expected
-ordering and worth not smoothing over. 90% vs 60% on factual is a clear win. On code it
-loses 70% → 60%, and the per-prompt records say why: the failures are the
-"output only JSON" prompts (`code-03`, `code-10`), where the 8B emitted 113 and 77
-completion tokens against the 1B's 22 and 12. It answered correctly and then kept
-talking, and the check tests instruction-following as much as capability. So this column
-measures **format compliance**, not reasoning ability, and a bigger model being chattier
-costs it marks here. Untested: whether a stricter prompt or a JSON-mode request would
-reverse it.
+| tier | model | factual | reasoning | code: content | code: format |
+|------|-------|---------|-----------|---------------|--------------|
+| `fast` | `llama3.2:1b` | 6/10 (60%) | **0/10 (0%)** | 7/10 | 9/10 |
+| `balanced` | `llama3.1:8b` | 9/10 (90%) | **5/10 (50%)** | **10/10** | 8/10 |
+
+Reasoning breaks down as mechanical 0/2 + rubric 0/8 for `fast`, and mechanical 1/2 +
+rubric 4/8 for `balanced`. The 1B scored **zero** on reasoning across all ten — not a
+narrow miss: it got the p50/p99 question backwards, invented $10,000-vs-$1,000,000
+arithmetic for two equal token totals, and answered the prompt-token question with "the
+8B generates more nuanced prompts".
+
+**No blended score.** The categories are not commensurable.
+
+#### Where the mechanical checks and the graders disagree
+
+An earlier version of this section reported code from the mechanical checks alone —
+"fast 7/10, balanced 6/10" — and concluded **"the 8B is better on facts and worse on
+code"**. Hand-grading does not support that. On content the 8B is **10/10 against the
+1B's 7/10**: strictly better, and perfect. It loses only on *following the output
+instruction*, 8/10 against 9/10.
+
+The mechanical column disagrees with the graders on four cells, and **not all in the
+same direction**:
+
+| prompt | tier | check | graders | what actually happened |
+|--------|------|-------|---------|------------------------|
+| `code-08` | fast | FAIL | pass | `git log --format=%s` prints one line per commit. The regex demanded the literal `--oneline`. **Check too narrow.** |
+| `code-08` | balanced | FAIL | pass | `git log --format=oneline` likewise. **Check too narrow.** |
+| `code-04` | balanced | FAIL | pass | Answered `` `-L` ``, correct. The regex required whitespace before the flag and a backtick is neither. **Check artifact.** |
+| `code-02` | fast | **pass** | **FAIL** | Emitted `from typing import Add`, which does not exist, so the code does not import. The regex only looked for the signature and never saw the broken line. **Check too generous.** |
+
+**For `fast` the two errors cancel.** Mechanical says 7/10 and content+format-both-pass is
+also 7/10 — the same number reached by one false failure and one false pass. A check that
+is wrong twice and right in total is the worst case for anyone reading the number alone.
+For `balanced` the checks understate by 2 (`code-04`, `code-08`), with no compensating
+error.
+
+The checks are left exactly as committed at `1bad7ca` rather than loosened after seeing
+results; `grades.jsonl` is the record of where they are wrong, and a future set should fix
+`code-02`, `code-04` and `code-08` before measuring anything else with them.
+
+#### The one disagreement between graders
+
+`code-02` [fast], content — **author: FAIL, session: pass.**
+
+- author: *"from typing import Add doesn't exist, so the code doesn't import"*
+- session: *"The requested signature is correct, body omitted."*
+
+The author's reading is the recorded result, and is the better one: the prompt asked for
+code, and code that raises `ImportError` on its first line is not correct code however
+right the signature below it is. The session graded the artifact asked for and ignored
+the rest of what was emitted — a narrower question than the one the prompt poses. This is
+also the cell where the mechanical check is too generous, for exactly the same reason, so
+the narrow reading was wrong twice independently.
 
 ### Prompt tokens per cell
 
@@ -107,6 +152,30 @@ Two honest consequences:
 
 **Cost of that routing: untested, Bedrock.** The local tiers have no measured marginal
 cost — the laptop is not metered — so there is no price to multiply these counts by.
+
+#### The adversarial set — the heuristic's known failure mode, on purpose
+
+`eval/prompts-adversarial.jsonl`, five short prompts built from the substring-containment
+false positives pinned in `tests/test_router.py`. **A separate file and a separate table,
+never merged into the 30-prompt results** — the committed set at `1bad7ca` stays exactly
+as it was measured.
+
+| id | prompt | words | keyword matched | routed to |
+|----|--------|-------|-----------------|-----------|
+| `adv-01` | "build me an analyzer" | 4 | `analyze` in "analyz**er**" | **powerful** |
+| `adv-02` | "the designer left early" | 4 | `design` in "design**er**" | **powerful** |
+| `adv-03` | "the signal analyzer is cheap" | 5 | `analyze` in "analyz**er**" | **powerful** |
+| `adv-04` | "who implemented the lift" | 4 | `implement` in "implement**ed**" | **powerful** |
+| `adv-05` | "is the debugger free" | 4 | `debug` in "debug**ger**" | **powerful** |
+
+**5 of 5 four-word questions route to the most expensive tier.** None of them asks for
+analysis, design, implementation or debugging. Put next to the 30-prompt set, where the
+same heuristic sends **0 of 30** genuine reasoning and code prompts to `powerful`, this is
+the whole problem in two tables: the keyword list decides what the expensive tier costs,
+and it is not reading intent — it is matching substrings.
+
+Cost of these five: **untested, Bedrock**. On a paid `powerful` tier they would be the
+most expensive requests in the workload.
 
 ### Memory, and which models were resident
 
