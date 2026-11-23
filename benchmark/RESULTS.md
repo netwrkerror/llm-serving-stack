@@ -14,6 +14,139 @@ not measured is not listed here.
 
 ---
 
+## Disconnect with a request queued behind it (2026-11-22)
+
+Stage 1 measured what a client disconnect does to the upstream. It did not measure what
+it does to the **next** request. This does.
+
+> The explicit `agen.aclose()` before the slot release was added **after Part 1 was
+> published** — it is the Stage 1 fix, not the code Part 1 described. What follows tests
+> whether it is enough.
+
+With one gateway slot and one Ollama slot, request B is admitted the instant A's slot is
+released, and Stage 1 releases that slot as soon as `aclose()` returns. The question is
+whether that instant is also when Ollama stops.
+
+**Headline: 16 of 20 pairs behave exactly as designed. The other 4 held the gateway's
+only slot for 101–155 seconds while Ollama generated 400 tokens for a client that had
+already gone.**
+
+**Conditions**
+
+| | |
+|---|---|
+| Date | 2026-11-22, 20:28–20:40 MST |
+| Hardware | Apple M5 Pro (`Mac17,9`), arm64 |
+| Ollama | 0.32.5, `library=Metal` verified from the server log, **`OLLAMA_NUM_PARALLEL:1`** |
+| Gateway | compose, **1 queue slot**, `GATEWAY_BACKEND=ollama` |
+| Load | 20 pairs per arm. A: streaming, `max_tokens=400`, client closes after its first content chunk. B: sent while A is in flight, so it queues. Control arm: identical, but A completes |
+| Clock offset | gateway − host = **+0.193 ms, ±1.538 ms** (NTP-style bracket via `/health` `now_ms`, 25 probes, best of) |
+| Ollama log poll | **10 ms** — the cancel stamp trails Ollama's own write by up to one interval |
+| Run dir | `benchmark/out/run-queued-disconnect-20261122-202845/` |
+
+### The four pairs that went wrong
+
+| pair | A's task | client received | Ollama generated | slot held | Ollama `cancel task` |
+|------|----------|-----------------|------------------|-----------|----------------------|
+| 0 | 18 | 1 chunk | **400 tokens** | **101.0 s** | never logged |
+| 1 | 452 | 1 chunk | **400 tokens** | **122.4 s** | never logged |
+| 5 | 1032 | 1 chunk | **400 tokens** | **154.6 s** | never logged |
+| 18 | 2049 | 1 chunk | **400 tokens** | **136.2 s** | never logged |
+
+From Ollama's own log for task 18: `eval time = 3411.75 ms / 400 tokens`, then
+`stop processing: n_tokens = 444`. A normal completion, no cancellation — because by the
+time the gateway closed the stream, Ollama had finished the whole generation seconds
+earlier and there was nothing left to cancel.
+
+The gateway's `request_cancelled` for those requests reports `duration_s = 101.125`,
+`122.601`, `154.6`, `136.2` against **0.228** for a normal pair. So the `finally` did
+run, and ran correctly — about 100 to 155 seconds late.
+
+**Across the disconnect arm: 1596 tokens generated for nobody** (4 × 400 produced, 4
+received), against 4 wasted in the other 16 pairs combined.
+
+**This is the Stage 1 "cleanup is not guaranteed" case, reproduced at 4 in 20 rather than
+1 in 90**, and with a consequence Stage 1 could not see: the slot. Stage 1 ran at 4 slots
+with nothing queued, so a late finalization cost only wasted tokens. At one slot with a
+request waiting, the same fault blocks the queue for two minutes.
+
+**Where B waited: the gateway queue, not Ollama.** B's `ollama.unattributed_ms` in those
+pairs is 3.1–4.0 ms, indistinguishable from the rest. The two minutes were spent entirely
+on the gateway's semaphore, waiting for a generator that was not being collected.
+
+**Cause, stated as far as the evidence goes.** The `finally` runs when the suspended
+async generator is finalized. With a plain reference drop CPython finalizes it at once,
+which is the 16-pair case at ~2.4 ms. When something holds a reference — a traceback, a
+cycle — finalization waits for the cyclic collector, and its timing has nothing to do
+with the request. The 101/122/136/155 s spread fits a collector running on its own
+schedule and **does not fit** the 120 s `request_timeout`, which would cluster. **Not
+proven:** no reference-cycle dump was taken, so what holds the generator is untested.
+
+### The 16 normal pairs
+
+| | |
+|---|---|
+| `aclose()` duration | p50 **0.002 ms**, max 2.473 ms |
+| A's `finally` → B admitted | p50 **2.35 ms**, max 2.88 ms (same clock, reliable) |
+| B's gateway queue wait | p50 60.9 ms — dominated by the harness's own 60 ms settle before A closes |
+| B's `ollama.unattributed_ms` | p50 **1.3 ms** |
+
+`aclose()` costs nothing measurable: closing the httpx stream is a socket teardown, not a
+round trip. When finalization happens on time, the whole release path is ~2.4 ms.
+
+### Ordering of A's cancel against B's admission: not resolved
+
+| | |
+|---|---|
+| gap `B_admit − A_cancel`, 16 pairs with both stamps | p50 **−3.6 ms**, min −13.9, max +9.2 |
+| B admitted before Ollama cancelled | 9 of 16 |
+
+**These numbers do not support a conclusion and are reported only to show why.** The
+cancel stamp comes from a 10 ms log poll, which biases it *late* — exactly the direction
+that makes B look as though it were admitted first. A p50 gap of 3.6 ms sits well inside
+that 10 ms, so the sign of the median is an artifact of the method as easily as a
+property of the system. The clock offset (±1.5 ms) is not the limiting term; the poll is.
+
+Resolving it needs the poll below the effect: `queued_disconnect.py --log-poll-ms 2`.
+Not run, so **untested**.
+
+**The question does not depend on it.** Whether B is admitted a few milliseconds before
+or after Ollama's cancel, the clock-independent measure says it costs B nothing:
+
+| arm | B's `ollama.unattributed_ms`, Ollama's own account of time B waited inside Ollama |
+|-----|------------------------------------------------------------------------------|
+| disconnect | n=20, p50 **1.3 ms**, min 1.1, max 4.0 |
+| control | n=20, p50 **2.8 ms**, min 1.2, max 3.7 |
+
+B waits **less** inside Ollama after a disconnect than in the control, not more. If the
+slot release were handing B to a backend still busy with A, this is the number that would
+rise, and it does not. The −1.4 ms difference of medians is small and in the harmless
+direction; the control is marginally higher because A has just finished a 400-token
+generation there, so the slot is handed over warm and busy rather than idle.
+
+### What this changes
+
+Stage 1 concluded that the semaphore release was never the problem. **At four slots with
+nothing queued, that held. At one slot with a request waiting, it does not** — not
+because the release is wrong, but because it cannot happen until the generator is
+finalized, and in 4 of 20 cases that took two minutes.
+
+The fix named in Stage 1 is the same one: detect the disconnect somewhere that is not
+inside the generator being cleaned up — an `http.disconnect` listener, or a pump task
+owned by the request — so neither the upstream close nor the slot release waits on the
+collector. **Still not implemented, still untested.**
+
+### Not measured
+
+| | |
+|---|---|
+| What holds the reference in the late pairs | untested — no cycle dump taken |
+| Ordering of B's admission against Ollama's cancel | **not resolved** at a 10 ms poll; needs ≤2 ms |
+| Whether the rate changes with slot count, model, or `max_tokens` | untested — one configuration |
+| The same experiment against a remote backend | **untested, Bedrock** |
+
+---
+
 ## Quality per tier, local tiers (2026-11-16)
 
 The cost table's quality column, for the two tiers that exist without credentials. The
@@ -29,6 +162,8 @@ Bedrock cell is a rerun of one tier away — see `eval/README.md`.
 | Gateway | compose at `1bad7ca`, `fast`=`ollama:llama3.2:1b`, `balanced`=`ollama:llama3.1:8b` |
 | Eval set | `eval/prompts.jsonl` @ **`1bad7ca`**, committed before this run, clean (not `-DIRTY`) |
 | Load | 30 prompts × 2 tiers, sequential, `temperature=0`, `max_tokens=256` |
+| Grading | two graders; **`author` is the reported column**, `claude-session` reported alongside |
+| Agreement | **55 / 56** items where both graders have a verdict |
 | Run dir | `benchmark/out/run-eval-1bad7ca-20261116-174250/` |
 
 Sequential on purpose: concurrency would add queue wait to the latency column, and this

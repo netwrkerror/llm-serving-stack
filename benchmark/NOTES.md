@@ -677,3 +677,62 @@ twice in opposite directions — a false FAIL on `code-08` and a false pass on `
 and land on 7/10 either way. A check that is wrong twice and right in total is worse than
 one that is simply wrong, because nothing in the number invites a second look. RESULTS now
 says "wrong in four places, in both directions" instead.
+
+## Stage 1b — disconnect with a request queued behind it (2026-11-22)
+
+**Stage 1's "1 in 90" turned into 4 in 20, and the consequence got much worse.** Stage 1
+saw one request out of ~90 run to full `max_tokens` after its client left, and recorded
+it as evidence that cleanup is not guaranteed. At one gateway slot with a request queued
+behind, the same fault showed up in 4 of 20 pairs — and this time it did not just waste
+tokens, it **held the gateway's only slot for 101 to 155 seconds**. B sat on the
+semaphore the whole time. Ollama, meanwhile, had finished generating all 400 tokens
+within ~3.4 s and logged no cancellation at all, because by the time the gateway closed
+the stream there was nothing left to cancel.
+
+The giveaway was in the gateway's own log once it carried a timestamp:
+`request_cancelled duration_s = 101.125` against `0.228` for a normal pair. The `finally`
+ran, and ran correctly. It ran a hundred seconds late.
+
+**Why the rate differs between the two experiments is not established.** Stage 1 ran at
+4 slots with nothing queued; this runs at 1 slot with a request waiting. Whether the
+queued request changes the reference graph, or 4-in-20 and 1-in-90 are the same rate
+seen through different sample sizes, is untested. The 101/122/136/155 s spread fits a
+cyclic collector running on its own schedule and does not fit the 120 s
+`request_timeout`, which would cluster — but no reference-cycle dump was taken, so what
+holds the generator is a hypothesis, not a finding.
+
+**It also corrects something Stage 1 said.** Stage 1 concluded "the semaphore release was
+never the problem", and at 4 slots with an empty queue that was true and measured. At 1
+slot with a request waiting it is false — not because the release is wrong, but because
+it cannot run until the generator is finalized. The release was never the problem; the
+*precondition* for the release is.
+
+**The ordering question is below the measurement's resolution, and saying so is the
+result.** The gap between B's admission and Ollama's cancel has a p50 of −3.6 ms, which
+would read as "B is admitted before Ollama stops". But the cancel stamp comes from a
+10 ms log poll that biases it late — precisely the direction that produces that sign. A
+3.6 ms effect measured with a 10 ms instrument is not a measurement. The clock offset
+(±1.5 ms, NTP-style against `/health`'s new `now_ms`) is not the limiting term; the poll
+is. `--log-poll-ms` now exists to tighten it; it has not been run.
+
+**The question survived the unresolvable part, which is why it was designed that way.**
+B's `ollama.unattributed_ms` needs no cross-process clock at all: Ollama's own accounting
+of how long B waited inside Ollama. Disconnect p50 1.3 ms against control p50 2.8 ms — B
+waits *less* after a disconnect, not more. Had the slot release been handing B to a
+backend still working on A, that number would rise. Worth remembering as a design habit:
+the figure that did not depend on aligning three clocks is the one that answered the
+question, and the two that did are the ones reported as inconclusive.
+
+**Instrumentation added for this, useful beyond it:** a `req_id` on every request, echoed
+as `X-Request-Id` and carried through every log line for that request. Without it two
+concurrent requests for the same model are indistinguishable in the log, which is exactly
+the case this experiment had to take apart. Also `slot_acquired` (the end of
+`llm.queue.wait`, logged rather than only traced), `backend_stream_closed` with how long
+`aclose()` took, millisecond stamps on `request_cancelled`, Ollama's phase timings on
+`request_completed`, and `now_ms` on `/health` so a caller can measure the clock offset
+rather than assume it.
+
+**Unsure / flagged:** one configuration only — 1 slot, `llama3.2:1b`, `max_tokens=400`.
+Whether the late-finalization rate moves with slot count, model size or token budget is
+untested, and 4 of 20 is a wide confidence interval on a rate. `aclose()` itself costs
+0.002 ms p50, so nothing here argues against calling it; the cost is in *reaching* it.
