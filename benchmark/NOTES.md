@@ -119,7 +119,7 @@ this repo should go through a real server, not `TestClient`.
 ## Stage 1 — client disconnect (2026-11-15)
 
 **The hypothesis was wrong, and that is the interesting part.** Ollama does not keep
-generating after a streaming client leaves: 89 of 90 measured disconnects were cancelled
+generating after a streaming client leaves: 109 of 110 measured disconnects were cancelled
 within 30–50 ms, wasting 1–3% of tokens. The upstream connection was already being closed
 — by CPython dropping the last reference to the suspended async generator and asyncio's
 finalizer hook scheduling `aclose()`. Nothing in the gateway was doing it on purpose,
@@ -680,8 +680,8 @@ says "wrong in four places, in both directions" instead.
 
 ## Stage 1b — disconnect with a request queued behind it (2026-11-22)
 
-**Stage 1's "1 in 90" turned into 4 in 20, and the consequence got much worse.** Stage 1
-saw one request out of ~90 run to full `max_tokens` after its client left, and recorded
+**Stage 1's "1 in 110" turned into 4 in 20, and the consequence got much worse.** Stage 1
+saw one request out of 110 run to full `max_tokens` after its client left, and recorded
 it as evidence that cleanup is not guaranteed. At one gateway slot with a request queued
 behind, the same fault showed up in 4 of 20 pairs — and this time it did not just waste
 tokens, it **held the gateway's only slot for 101 to 155 seconds**. B sat on the
