@@ -133,6 +133,11 @@ class Pair:
     a_first_chunk_at: float | None = None
     b_sent_at: float | None = None
     a_chunks: int = 0
+    # True when A's stream reached its own end before the client could cut it off --
+    # a short answer that stopped on its own. Such a pair is not a disconnect and must
+    # not be counted as one: it has no cancellation to log and nothing for Ollama to
+    # cancel, so it would otherwise read as a fault.
+    a_completed: bool = False
     b_status: int | None = None
     error: str | None = None
     # filled from the gateway log, gateway clock
@@ -304,7 +309,9 @@ def attach_gateway_log(pairs: list[Pair], lines: list[str]) -> list[str]:
         if done:
             p.b_unattributed_ms = done.get("ollama_unattributed_ms")
             p.b_total_ms = done.get("ollama_total_ms")
-        if p.arm == "disconnect" and not cancel:
+        if a.get("request_completed"):
+            p.a_completed = True
+        if p.arm == "disconnect" and not cancel and not p.a_completed:
             warnings.append(f"pair {p.index}: no request_cancelled for A ({p.a_req_id})")
         if slot is None:
             warnings.append(f"pair {p.index}: no slot_acquired for B ({p.b_req_id})")
@@ -349,7 +356,12 @@ def fmt(v, nd=1):
 
 def report(args, pairs: list[Pair], offset: dict, warnings: list[str]) -> str:
     L, w = [], lambda s: L.append(s)
-    disc = [p for p in pairs if p.arm == "disconnect" and not p.error]
+    # A pair where A finished on its own is excluded from the disconnect arm: the
+    # client never got to cut it off, so it measures nothing about disconnects.
+    disc = [p for p in pairs
+            if p.arm == "disconnect" and not p.error and not p.a_completed]
+    excluded = [p for p in pairs
+                if p.arm == "disconnect" and not p.error and p.a_completed]
     ctrl = [p for p in pairs if p.arm == "control" and not p.error]
 
     # Host-clock stamps (A's close, Ollama's cancel) moved onto the gateway's clock.
@@ -363,8 +375,9 @@ def report(args, pairs: list[Pair], offset: dict, warnings: list[str]) -> str:
             return None
         return v + off
 
-    w(f"queued disconnect | pairs={args.pairs} per arm | max_tokens A={args.max_tokens_a} "
-      f"B={args.max_tokens_b}")
+    w(f"queued disconnect | arms={args.arms} | disconnect pairs={args.pairs} | "
+      f"control pairs={args.control_pairs or args.pairs} | "
+      f"max_tokens A={args.max_tokens_a} B={args.max_tokens_b}")
     w(f"gateway slots=1, OLLAMA_NUM_PARALLEL=1 (B must queue behind A)")
     w(f"wall clock: {time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     w(f"ollama log poll: {args.log_poll_ms:.0f} ms  "
@@ -390,7 +403,40 @@ def report(args, pairs: list[Pair], offset: dict, warnings: list[str]) -> str:
 
     w("SUMMARY")
     w(f"  disconnect pairs usable        {len(disc)}/{args.pairs}")
-    w(f"  control pairs usable           {len(ctrl)}/{args.pairs}")
+    if excluded:
+        w(f"  excluded, A finished first      {len(excluded)}  "
+          f"(pairs {[p.index for p in excluded]}) -- not disconnects, not counted")
+    w(f"  control pairs usable           {len(ctrl)}/{args.control_pairs or args.pairs}")
+    # The fault this harness exists to catch: cleanup that ran far too late, which shows
+    # up as the queue slot being held for seconds rather than milliseconds.
+    late = [p for p in disc if (p.b_queue_wait_ms or 0) > 10_000]
+    w(f"  LATE pairs (slot held >10 s)   {len(late)}/{len(disc)}"
+      + ("  <-- the fault" if late else "  <-- none"))
+    if disc:
+        held = [p.b_queue_wait_ms for p in disc if p.b_queue_wait_ms is not None]
+        if held:
+            w(f"  slot held, max (ms)            {max(held):.1f}")
+    for p in late:
+        w(f"    pair {p.index}: slot held {p.b_queue_wait_ms/1000:.1f} s, "
+          f"A chunks {p.a_chunks}, ollama cancel "
+          f"{'logged' if p.a_cancelled_at else 'NEVER'}")
+    # The distribution matters more than the count once something is bounding the
+    # fault. A forced collection every N seconds should move stuck pairs from ~120 s
+    # down to ~N, not make them disappear -- so a run with pairs sitting in the
+    # 0.2-2 s band is positive evidence that a cyclic collection is what frees them,
+    # while a run where every pair is under 200 ms simply never hit the fault.
+    held = [p.b_queue_wait_ms for p in disc if p.b_queue_wait_ms is not None]
+    if held:
+        buckets = [("<200 ms (normal)", lambda v: v < 200),
+                   ("200 ms - 2 s", lambda v: 200 <= v < 2_000),
+                   ("2 - 10 s", lambda v: 2_000 <= v < 10_000),
+                   (">10 s (the fault)", lambda v: v >= 10_000)]
+        w("  slot-held distribution")
+        for label, test in buckets:
+            n = sum(1 for v in held if test(v))
+            bar = "#" * n
+            w(f"    {label:<20} {n:>3}  {bar}")
+        w(f"    every pair (ms): " + " ".join(f"{v:.0f}" for v in held))
 
     both = [p for p in disc
             if p.b_admitted_at is not None and to_gw(p.a_cancelled_at) is not None]
@@ -465,6 +511,11 @@ def report(args, pairs: list[Pair], offset: dict, warnings: list[str]) -> str:
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Disconnect with a request queued behind it.")
     ap.add_argument("--pairs", type=int, default=20)
+    ap.add_argument("--arms", default="disconnect,control",
+                    help="comma-separated: disconnect, control. The diagnostic runs "
+                         "need only the disconnect arm.")
+    ap.add_argument("--control-pairs", type=int, default=None,
+                    help="pairs in the control arm; defaults to --pairs")
     ap.add_argument("--max-tokens-a", type=int, default=400)
     ap.add_argument("--max-tokens-b", type=int, default=32)
     ap.add_argument("--model", default="llama3.2:1b")
@@ -491,8 +542,10 @@ async def main() -> int:
 
     async with LogFollower(log_path, poll=args.log_poll_ms / 1000.0) as follower:
         async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
-            for arm in ("disconnect", "control"):
-                for i in range(args.pairs):
+            arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+            for arm in arms:
+                n = args.pairs if arm == "disconnect" else (args.control_pairs or args.pairs)
+                for i in range(n):
                     p = Pair(index=i, arm=arm)
                     await run_pair(client, args.gateway, args.model, p,
                                    args.max_tokens_a, args.max_tokens_b, args.settle_ms)
