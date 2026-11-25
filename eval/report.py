@@ -21,6 +21,7 @@ grade at all.
 import argparse
 import hashlib
 import json
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -59,6 +60,9 @@ def main() -> int:
     args = ap.parse_args()
 
     run_dir = Path(args.run)
+    sys.path.insert(0, str(ROOT.parent / 'benchmark'))
+    from runmeta import require_valid
+    require_valid(run_dir)
     data, grades = load(run_dir)
     results = {(r["prompt_id"], r["tier"]): r for r in data["results"]}
 

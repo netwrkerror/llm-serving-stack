@@ -25,6 +25,9 @@ import statistics
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from runmeta import require_valid  # noqa: E402
+
 
 def analyse(run_dir: Path) -> tuple[list[dict], list[str]]:
     pairs = json.loads((run_dir / "pairs.json").read_text())["pairs"]
@@ -126,6 +129,9 @@ def main() -> int:
         return 2
     for arg in sys.argv[1:]:
         run_dir = Path(arg)
+        # Refuses outright on a run that failed its own checks; prints a banner
+        # for one that predates them.
+        require_valid(run_dir)
         rows, notes = analyse(run_dir)
         text = report(run_dir, rows, notes)
         (run_dir / "after-close-by-pair.txt").write_text(text + "\n")

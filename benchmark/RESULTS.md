@@ -56,6 +56,8 @@ one collection interval — against 101–155 s unforced.
 | saveall | `gc.DEBUG_SAVEALL` | **4 of 40 found in cycles**, all already closed |
 | diag + referrers | per-request registry | **0 of 60 late** |
 
+Source: `run-queued-disconnect-20261122-202845/report.txt`, `run-queued-disconnect-nodiag-20261122-211128/report.txt`, `run-queued-disconnect-gctest-20261122-212756/report.txt`, `run-queued-disconnect-saveall-20261122-214139/report.txt`, `run-queued-disconnect-diag-20261122-210725/report.txt`, `run-queued-disconnect-referrers-20261122-212301/report.txt`
+
 The last row is an observer effect, not a result: one-sided Fisher exact on 0/60 against
 5/40 gives **p = 0.0087**. The first version of the stuck-stream diagnostic allocated
 four objects per request, and allocation pressure is what drives CPython's generational
@@ -128,6 +130,8 @@ back to calling the cleanup object directly.
 | `finally` → B admitted | 2.35 ms p50 | 2.7 ms p50, max 4.3 ms |
 | `aclose()` duration | 0.002 ms p50 | 0.001 ms p50, max 0.362 ms |
 
+Source: `run-queued-disconnect-validate-20261122-215941/report.txt`
+
 **Stated as a bound, not as "fixed".** Zero late pairs in 59 gives a one-sided 95% upper
 bound on the true rate of **4.95%**. `P(0 in 59 | 12.5%) = 3.8 × 10⁻⁴`. This rules out a
 rate of 5% or more. It does not rule out something rarer.
@@ -147,6 +151,8 @@ usual case and the source is recorded per pair.
 | late pairs: total | **1596** | **none** |
 | late pairs: max per pair | **399** | — |
 | whole arm total | 1782 | 655 |
+
+Source: `run-queued-disconnect-20261122-202845/after-close-by-pair.txt` and `run-queued-disconnect-validate-20261122-215941/after-close-by-pair.txt`
 
 **The steady-state waste is unchanged, and that is the correct result.** ~11 tokens per
 pair before and after. It is the harness's own doing: A's client reads one chunk and then
@@ -188,6 +194,8 @@ At a 2 ms poll the effect finally exceeds the instrument:
 | gap `B_admit − A_cancel` | p50 **−3.3 ms**, min −11.3, max +1.1 |
 | B admitted before Ollama's cancel | 53 of 59 |
 | gaps exceeding the ±1.646 ms clock uncertainty | 40 of 59 |
+
+Source: `run-queued-disconnect-validate-20261122-215941/report.txt`
 
 The poll still biases the cancel stamp late by up to 2 ms, which flatters this direction,
 so the honest reading is **B is admitted roughly 1.3–3.3 ms before Ollama logs the
@@ -259,6 +267,8 @@ already gone.**
 | 5 | 1032 | 1 chunk | **400 tokens** | **154.6 s** | never logged |
 | 18 | 2049 | 1 chunk | **400 tokens** | **136.2 s** | never logged |
 
+Source: `run-queued-disconnect-20261122-202845/report.txt` and `run-queued-disconnect-20261122-202845/after-close-by-pair.txt`
+
 From Ollama's own log for task 18: `eval time = 3411.75 ms / 400 tokens`, then
 `stop processing: n_tokens = 444`. A normal completion, no cancellation — because by the
 time the gateway closed the stream, Ollama had finished the whole generation seconds
@@ -297,6 +307,8 @@ proven:** no reference-cycle dump was taken, so what holds the generator is unte
 | B's gateway queue wait | p50 60.9 ms — dominated by the harness's own 60 ms settle before A closes |
 | B's `ollama.unattributed_ms` | p50 **1.3 ms** |
 
+Source: `run-queued-disconnect-20261122-202845/report.txt`
+
 `aclose()` costs nothing measurable: closing the httpx stream is a socket teardown, not a
 round trip. When finalization happens on time, the whole release path is ~2.4 ms.
 
@@ -306,6 +318,8 @@ round trip. When finalization happens on time, the whole release path is ~2.4 ms
 |---|---|
 | gap `B_admit − A_cancel`, 16 pairs with both stamps | p50 **−3.6 ms**, min −13.9, max +9.2 |
 | B admitted before Ollama cancelled | 9 of 16 |
+
+Source: `run-queued-disconnect-20261122-202845/report.txt`
 
 **These numbers do not support a conclusion and are reported only to show why.** The
 cancel stamp comes from a 10 ms log poll, which biases it *late* — exactly the direction
@@ -323,6 +337,8 @@ or after Ollama's cancel, the clock-independent measure says it costs B nothing:
 |-----|------------------------------------------------------------------------------|
 | disconnect | n=20, p50 **1.3 ms**, min 1.1, max 4.0 |
 | control | n=20, p50 **2.8 ms**, min 1.2, max 3.7 |
+
+Source: `run-queued-disconnect-20261122-202845/report.txt`
 
 B waits **less** inside Ollama after a disconnect than in the control, not more. If the
 slot release were handing B to a backend still busy with A, this is the number that would
@@ -455,6 +471,8 @@ the narrow reading was wrong twice independently.
 | `fast` | `llama3.2:1b` | 1426 | 47.5 | 811 |
 | `balanced` | `llama3.1:8b` | 976 | 32.5 | 948 |
 
+Source: `run-eval-1bad7ca-20261116-174250/report.txt`
+
 Mean difference is **exactly 15.0 tokens per prompt**, which independently reproduces the
 template finding in `NOTES.md` (measured there as 32 vs 17 on a single prompt). The
 `llama3.2` template emits a system block with a knowledge-cutoff line unconditionally;
@@ -473,6 +491,8 @@ per-token price would not notice.
 | reasoning | 4 | 6 | 0 |
 | code | 9 | 1 | 0 |
 | **total** | **22** | **8** | **0** |
+
+Source: `run-eval-1bad7ca-20261116-174250/report.txt`
 
 **`powerful` is unreachable for this workload.** Not under-used — unreachable. The
 heuristic sends a prompt to `powerful` only on a complexity keyword or ≥120 words, and
@@ -540,6 +560,8 @@ latency figures in `results.json`.
 | Whether the code-category gap survives a stricter prompt or JSON mode | untested |
 | Run-to-run variance | single run per tier at `temperature=0`; no repeats |
 
+Source: `run-eval-1bad7ca-20261116-174250/report.txt`
+
 ---
 
 ## Policy routing and fallback (2026-11-16)
@@ -585,6 +607,8 @@ conclude the mechanism does not work. The kill was moved to 4 s, which is mid-ru
 | p50 e2e, fell back | **1.474 s** | **1.550 s** |
 | p50 TTFT, normal | 0.239 s | 0.232 s |
 | p50 TTFT, fell back | 0.304 s | 0.239 s |
+
+Source: `run-fallback-20261116-173336/rep1/report.txt` and `run-fallback-20261116-173336/rep2/report.txt`
 
 Falling back cost **+0.52 s** and **+0.19 s** on p50 end-to-end across the two repeats —
 one refused connection plus a second backend's prefill, on the same machine. The spread
@@ -730,6 +754,8 @@ mapping for the rest of this stage is:
 | `balanced` | ollama | `llama3.1:8b` | local half of the controlled comparison |
 | `powerful` | bedrock | an Active model, chosen at run time (below) | paid tier |
 
+Source: `run-fallback-20261116-172519/transcript.txt`
+
 `balanced` vs `powerful` is only a controlled comparison when `powerful` is the same 8B
 weights on Bedrock. Against a 70B it is not, and is labelled as different models.
 
@@ -815,6 +841,8 @@ Runnable without AWS, so it was run. This is the (c) cell of
 |------|---------|-------|---|----------|---------|------------|----------------|
 | local-gateway | ollama | `llama3.2:1b` | 10 | 0.202 s | 0.663 s | 58 | yes |
 
+Source: `run-bedrock-compare-20261115-210022/report.txt`
+
 Reported usage over the 10 requests: 346 prompt tokens, 584 completion tokens.
 Marginal cost of these 10 requests locally: **not measured** — the laptop has not been
 metered. Not "$0".
@@ -844,6 +872,8 @@ whether an 8B is usable on this machine at all.
 |------|---------|-------|---|----------|---------|------------|----------------|
 | local | ollama | `llama3.2:1b` | 10 | 0.204 s | 0.678 s | 53 | yes |
 | local | ollama | `llama3.1:8b` | 10 | **0.314 s** | **1.899 s** | 48 | yes |
+
+Source: `run-local-8b-20261115-221501/report.txt` and `run-local-8b-20261115-221501/conditions.txt`
 
 Reported usage over 10 requests: 1B — 346 prompt, 596 completion. 8B — 196 prompt, 700
 completion. Marginal cost locally for either: **not measured**, the laptop is not metered.
@@ -956,6 +986,8 @@ the request. **Untested; not implemented.**
 | `llm_tokens_generated_total` | 8 — the warm-up's only | unchanged |
 | `llm.outcome` on `llm.request` | absent | `cancelled` / `completed` / `error` |
 
+Source: (source not recorded — read from the live `/metrics` endpoint during the run, not saved to the run directory)
+
 Before the fix a cancelled request incremented nothing: the `done` branch never runs, and
 the `except Exception` branch does not catch the unwinding. 60 disconnects that cost real
 GPU time were invisible on every dashboard. `llm_requests_cancelled_total` is deliberately
@@ -975,6 +1007,8 @@ could be recovered another way.
 | before | 4 | 0.030 s | 0.053 s |
 | after | 1 | 0.030 s | 0.056 s |
 | after | 4 | 0.034 s | 0.049 s |
+
+Source: `run-disconnect-before-metal-20261115-171955/transcript.txt`
 
 Unchanged by the fix, as expected: the close happens at finalization either way.
 
@@ -1045,6 +1079,8 @@ Both repetitions shown, with the spread between them. The write-up quotes the me
 | | latency p50 | 6.220 | 6.080 | **6.150 s** | 2.3% |
 | | tokens/sec | 100.7 | 97.9 | **99.3** | 2.8% |
 
+Source: `run-1-20261115-100640/transcript.txt`
+
 **`OLLAMA_NUM_PARALLEL=4`**
 
 | scenario | metric | rep 1 | rep 2 | mean | spread |
@@ -1061,6 +1097,8 @@ Both repetitions shown, with the spread between them. The write-up quotes the me
 | | TTFT p95 | 2.238 | 1.763 | **2.000 s** | 23.7% |
 | | latency p50 | 2.700 | 2.610 | **2.655 s** | 3.4% |
 | | tokens/sec | 209.3 | 242.2 | **225.8** | 14.6% |
+
+Source: `run-1-20261115-100640/transcript.txt`
 
 Two cells are too noisy to quote on their own: `=1` sequential TTFT p95 (52.4% spread,
 the 7th of 8 samples) and `=4` at-capacity TTFT p95 (40.7%). The load-bearing figures
@@ -1079,6 +1117,8 @@ across repetitions.
 | oversubscribed, c=8 — TTFT p50 | 5.335 s | 1.622 s | 3.3× lower |
 | oversubscribed, c=8 — tokens/sec | 99.3 | 225.8 | 2.27× higher |
 
+Source: `run-1-20261115-100640/transcript.txt`
+
 At `=1` aggregate throughput is pinned near 100 tok/s at every concurrency level —
 100.8, 105.2, 99.3. Concurrency buys no extra work, only queueing. The `c=1` row is the
 control: identical under both settings, because with one request in flight there is
@@ -1093,6 +1133,8 @@ Measured over the at-capacity window, where gateway queue wait is effectively ze
 |---------|-----------------|-----------------|-----------|-------|
 | `=1` | 37.3 | 133.7 | 105.2 | 2.8× |
 | `=4` | 72.2 | 103.7 | 217.8 | 3.0× |
+
+Source: `run-1-20261115-100640/transcript.txt`
 
 Two different quantities. `llm_tokens_per_second` is a histogram of **per-request**
 rates — one observation per request, its own tokens over its own generation time.
@@ -1119,6 +1161,8 @@ gateway (>50 ms) or went straight through.
 | | queued >50 ms | 651.96 | 820.00 | 1059.19 |
 | `queue_wait_ms` | queued | 649.25 | 3060.91 | 3421.83 |
 
+Source: `run-1-20261115-100640/transcript.txt`
+
 **`OLLAMA_NUM_PARALLEL=4`**
 
 | metric | group | min | median | max |
@@ -1130,6 +1174,8 @@ gateway (>50 ms) or went straight through.
 | `eval_ms` | no queue wait | 829.76 | 956.86 | 1126.34 |
 | | queued >50 ms | 878.94 | 1067.72 | 1464.42 |
 | `queue_wait_ms` | queued | 1040.65 | 1312.57 | 1858.49 |
+
+Source: `run-1-20261115-100640/transcript.txt`
 
 The model is warm before every run, and uncontended requests load in a tight
 157–174 ms under both settings. Requests released from the gateway queue report
@@ -1164,6 +1210,8 @@ across runs.
 | **`ollama.unattributed_ms`** | **2634.30** | **6.89** |
 | `first_token` → `ttft_ms` | 6282.98 | 2329.97 |
 | `first_token` → `since_generation_start_ms` | 3039.65 | 467.30 |
+
+Source: `run-1-20261115-100640/transcript.txt`
 
 `load_ms` and `eval_ms` are near-identical between the two; `unattributed_ms` differs by
 382×. `load_ms` is actually *higher* in the `=4` trace (424 vs 381) despite that request
@@ -1218,6 +1266,8 @@ Grafana `llm_tokens_per_second` panel, which is a histogram of per-request rates
 | at capacity, c=4 | 1.51 / 1.40 s | 2.01 / 1.57 s | 0.204 / 0.228 s | 0.455 / 0.427 s | 202 / 228 | 24/24 |
 | oversubscribed, c=8 | 2.84 / 2.46 s | 3.45 / 2.76 s | 1.767 / 1.513 s | 2.167 / 1.751 s | 214 / 234 | 16/16 |
 
+Source: (source not recorded — read from Jaeger spans by hand, 2026-11-13, before run directories existed)
+
 Both repetitions are shown. Each run is 96 requests across its six scenario-runs;
 192/192 succeeded over the two runs, with no errors.
 
@@ -1231,6 +1281,8 @@ Both repetitions are shown. Each run is 96 requests across its six scenario-runs
 | at capacity, c=4 — tok/s | 101 | 215 | **2.1× higher** |
 | oversubscribed, c=8 — TTFT p50 | 5.30 s | 1.64 s | 3.2× lower |
 | oversubscribed, c=8 — tok/s | 102 | 224 | 2.2× higher |
+
+Source: (source not recorded — derived from the two tables above)
 
 ### What this shows
 
@@ -1261,6 +1313,8 @@ Two `llm.inference` spans from these runs:
 | **`ollama.unattributed_ms`** | **1856.50** | **9.00** |
 | `first_token` → `ttft_ms` | 5488.74 | 1735.98 |
 | `first_token` → `since_generation_start_ms` | 2276.24 | 213.41 |
+
+Source: (source not recorded — read from Jaeger spans by hand, 2026-11-13)
 
 `unattributed_ms` is the term that moves: 1856 ms of the `=1` request's time inside
 Ollama is attributable to neither load, prompt eval, nor its own token generation —
