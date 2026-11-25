@@ -1,0 +1,12 @@
+classify() over eval/prompts-adversarial.jsonl (5 prompts)
+no model is called; this is the router's decision only
+
+id       words  claimed     actually matched    routed to 
+----------------------------------------------------------
+adv-01       4  analyze     analyze             powerful  
+adv-02       4  design      design              powerful  
+adv-03       5  analyze     analyze             powerful  
+adv-04       4  implement   implement           powerful  
+adv-05       4  debug       debug               powerful  
+
+totals: {'powerful': 5}
