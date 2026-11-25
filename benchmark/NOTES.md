@@ -817,3 +817,13 @@ produced by different procedures, and nothing forced them onto the same rule.
 `benchmark/after_close.py` now applies one rule to any run directory and writes
 `after-close-by-pair.txt` beside the run, recording **per pair** which source each count
 came from. Two runs cannot silently diverge again.
+
+**The shield stays unconditional, deliberately differing from upstream.** Kludex/starlette
+PR #3685 shields the close only while an exception is propagating and closes unshielded
+on normal exit, to avoid building a `CancelScope` on every response. This gateway shields
+every time, for two reasons. The cost is microseconds of scope setup against a request
+measured in hundreds of milliseconds, so it is not a trade worth making. And the
+unconditional version covers a case the conditional one does not: a shutdown cancellation
+arriving in the middle of an ordinary close still lets that close finish, rather than
+being cut off because no exception happened to be in flight when it started. Recorded as
+a divergence rather than an oversight; nothing queued to change it.
