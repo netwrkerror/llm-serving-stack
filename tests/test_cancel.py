@@ -342,3 +342,174 @@ def registry_backend():
 
     yield make
     main._backends.pop("fake", None)
+
+
+# --- the other disconnect path: OSError from send() ----------------------------------
+#
+# ASGI spec_version 2.4+ has no listen_for_disconnect. A disconnect arrives as an
+# OSError from send() (uvicorn raises ClientDisconnected, a subclass), so the response
+# unwinds by exception rather than by scope cancellation. starlette 0.38.6 does not
+# branch on spec_version, so nothing here exercises this today even though uvicorn 0.32
+# reports 2.4 — but upgrading Starlette would switch to it silently. Pinned, and tested.
+
+def test_oserror_from_send_still_closes_the_iterator():
+    """Drive ClosingStreamingResponse.__call__ directly with a send that dies."""
+    sent = []
+
+    class Backend:
+        def __init__(self):
+            self.closed = False
+
+        async def generate_stream(self, req):
+            try:
+                n = 0
+                while True:
+                    n += 1
+                    yield f"tok{n}", False, n, {}
+                    await asyncio.sleep(0)
+            finally:
+                self.closed = True
+
+    async def run():
+        fake = Backend()
+        main._backends["fake"] = fake
+        before = slots_free()
+        try:
+            resp, _used = await main._stream_response(
+                req("send-dies"), "fast", 0.0, route_for("send-dies"))
+
+            async def receive():
+                # No http.disconnect ever arrives on this path; that is the point.
+                await asyncio.sleep(3600)
+
+            async def send(message):
+                sent.append(message["type"])
+                if message["type"] == "http.response.body" and len(sent) >= 3:
+                    raise OSError("client went away")   # what uvicorn raises
+
+            try:
+                await resp(
+                    {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send)
+            except (OSError, BaseExceptionGroup):
+                # Wrapped, not bare: stream_response runs in starlette's anyio task
+                # group, so a child exception comes back as an ExceptionGroup. The
+                # exception is the server's to handle; the cleanup is ours either way.
+                pass
+            return fake.closed, slots_free() == before
+        finally:
+            main._backends.pop("fake", None)
+            if slots_free() != before:
+                main._queue.release()
+
+    closed, slot_returned = asyncio.run(run())
+    assert closed, "backend teardown did not run when send() raised OSError"
+    assert slot_returned, "slot leaked when send() raised OSError"
+    assert "http.response.start" in sent, "the response never started"
+
+
+def test_oserror_before_any_body_still_releases_the_slot():
+    """The harshest version: send() dies on the very first body write."""
+    class Backend:
+        def __init__(self):
+            self.closed = False
+
+        async def generate_stream(self, req):
+            try:
+                yield "tok1", False, 1, {}
+                await asyncio.sleep(3600)
+            finally:
+                self.closed = True
+
+    async def run():
+        fake = Backend()
+        main._backends["fake"] = fake
+        before = slots_free()
+        try:
+            resp, _used = await main._stream_response(
+                req("send-dies-early"), "fast", 0.0, route_for("send-dies-early"))
+
+            async def receive():
+                await asyncio.sleep(3600)
+
+            async def send(message):
+                if message["type"] == "http.response.body":
+                    raise OSError("client went away")
+
+            try:
+                await resp({"type": "http"}, receive, send)
+            except (OSError, BaseExceptionGroup):
+                pass
+            return fake.closed, slots_free() == before
+        finally:
+            main._backends.pop("fake", None)
+            if slots_free() != before:
+                main._queue.release()
+
+    closed, slot_returned = asyncio.run(run())
+    assert closed, "backend teardown did not run"
+    assert slot_returned, "slot leaked"
+
+
+# --- span hierarchy survives the OTel context change --------------------------------
+
+def test_inference_span_is_still_a_child_of_the_request_span():
+    """Removing `use_span` from across the yields must not reparent anything.
+
+    Parentage is fixed when a span is created, not when it is current, and the spans
+    are created in _stream_response where the request span is still attached. This
+    asserts that rather than trusting it, because the alternative is checking Jaeger by
+    eye after every change.
+    """
+    created = {}
+
+    class RecordingTracer:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def start_span(self, name, *a, **kw):
+            span = self._inner.start_span(name, *a, **kw)
+            created[name] = span
+            return span
+
+        def start_as_current_span(self, name, *a, **kw):
+            return self._inner.start_as_current_span(name, *a, **kw)
+
+    class Finite:
+        async def generate_stream(self, req):
+            yield "hi", False, 1, {}
+            yield "", True, 1, {"timings": {}, "usage": {"completion_tokens": 1}}
+
+    # A real SDK tracer: with tracing off (the shipped default) every span is a
+    # NonRecordingSpan with no parentage to check, so the assertion below would be
+    # vacuous rather than true.
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = TracerProvider()
+    sdk_tracer = provider.get_tracer("test")
+    real = main.get_tracer
+
+    async def run():
+        main._backends["fake"] = Finite()
+        try:
+            resp, _used = await main._stream_response(
+                req("span-test"), "fast", 0.0, route_for("span-test"), "rid-span")
+            async for _ in resp.body_iterator:
+                pass
+        finally:
+            main._backends.pop("fake", None)
+
+    main.get_tracer = lambda: RecordingTracer(sdk_tracer)
+    try:
+        asyncio.run(run())
+    finally:
+        main.get_tracer = real
+
+    assert "llm.request" in created and "llm.inference" in created, created.keys()
+    request_span = created["llm.request"]
+    inference_span = created["llm.inference"]
+    parent = inference_span.parent
+    assert parent is not None, "llm.inference has no parent"
+    assert parent.span_id == request_span.get_span_context().span_id, (
+        "llm.inference is no longer a child of llm.request"
+    )
+    assert parent.trace_id == request_span.get_span_context().trace_id

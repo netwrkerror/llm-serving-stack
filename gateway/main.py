@@ -679,23 +679,27 @@ class _StreamCleanup:
         aclose_ms = round((time.perf_counter() - aclose_from) * 1000, 3)
 
         if outcome == "cancelled":
-            log.info("backend_stream_closed", extra={
-                "req_id": self._req_id,
-                "model": self._model,
-                "finally_at_ms": finally_at,
-                "at_ms": _now_ms(),
-                "aclose_ms": aclose_ms,
-            })
-            REQUESTS_CANCELLED.labels(model=self._model).inc()
-            log.info("request_cancelled", extra={
-                "req_id": self._req_id,
-                "model": self._model,
-                "stream": True,
-                "duration_s": round(time.perf_counter() - self._arrival, 3),
-                "finally_at_ms": finally_at,
-                "at_ms": _now_ms(),
-                "tokens_sent": sent_tokens,
-            })
+            # Attached here rather than around the aclose above: the enter and exit
+            # happen in one frame in whichever task is doing the cleanup, so the
+            # contextvar token is always reset in the Context that created it.
+            with otel_trace.use_span(self._span, end_on_exit=False):
+                log.info("backend_stream_closed", extra={
+                    "req_id": self._req_id,
+                    "model": self._model,
+                    "finally_at_ms": finally_at,
+                    "at_ms": _now_ms(),
+                    "aclose_ms": aclose_ms,
+                })
+                REQUESTS_CANCELLED.labels(model=self._model).inc()
+                log.info("request_cancelled", extra={
+                    "req_id": self._req_id,
+                    "model": self._model,
+                    "stream": True,
+                    "duration_s": round(time.perf_counter() - self._arrival, 3),
+                    "finally_at_ms": finally_at,
+                    "at_ms": _now_ms(),
+                    "tokens_sent": sent_tokens,
+                })
 
         for span in (self._span, self._inf_span):
             if span is not None:
@@ -957,100 +961,110 @@ async def _stream_response(req: ChatCompletionRequest, tier: str, arrival: float
         # cancelled request can still report what the client actually received.
         sent_tokens = 0
         try:
-            with otel_trace.use_span(span, end_on_exit=False):
-                with otel_trace.use_span(inf_span, end_on_exit=False):
-                    try:
-                        async for token, done, token_count, meta in _prepend(first, agen):
-                            if token and not first_token_recorded:
-                                # From arrival, not from generation start: queue wait is
-                                # latency the caller actually feels.
-                                ttft = time.perf_counter() - arrival
-                                TTFT.labels(model=model).observe(ttft)
-                                inf_span.add_event("first_token", {
-                                    "ttft_ms": round(ttft * 1000, 2),
-                                    "since_generation_start_ms": round((time.perf_counter() - gen_start) * 1000, 2),
-                                })
-                                first_token_recorded = True
+            # No span is attached across a `yield`. otel's use_span resets a contextvar
+            # token on exit, and when this generator is closed from another task -- the
+            # normal case now that ClosingStreamingResponse closes it -- that reset
+            # happens in a different Context and raises, which otel logs at ERROR on
+            # every disconnect. Span *parentage* is fixed when a span is created, not
+            # when it is current, so attaching only around the non-yielding sections
+            # below leaves the llm.request -> llm.inference hierarchy untouched while
+            # keeping trace_id on the log lines that matter.
+            try:
+                async for token, done, token_count, meta in _prepend(first, agen):
+                    if token and not first_token_recorded:
+                        # From arrival, not from generation start: queue wait is
+                        # latency the caller actually feels.
+                        ttft = time.perf_counter() - arrival
+                        TTFT.labels(model=model).observe(ttft)
+                        with otel_trace.use_span(inf_span, end_on_exit=False):
+                            inf_span.add_event("first_token", {
+                                "ttft_ms": round(ttft * 1000, 2),
+                                "since_generation_start_ms": round((time.perf_counter() - gen_start) * 1000, 2),
+                            })
+                        first_token_recorded = True
 
-                            if token:
-                                chunk = {
-                                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                                    "object": "chat.completion.chunk",
-                                    "model": model,
-                                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}],
-                                }
-                                yield f"data: {json.dumps(chunk)}\n\n"
-                                sent_tokens += 1
+                    if token:
+                        chunk = {
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": token}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                        sent_tokens += 1
 
-                            if done:
-                                # generation time drives throughput; end-to-end drives latency
-                                duration = time.perf_counter() - gen_start
-                                e2e = time.perf_counter() - arrival
-                                ollama_timings = _record_backend_timings(
-                                    inf_span, meta.get("timings", {}))
-                                billed = _completion_tokens(meta, token_count)
-                                REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
-                                REQUEST_DURATION.labels(model=model, stream="true", status="success").observe(e2e)
-                                TOKENS_GENERATED.labels(model=model).inc(billed)
-                                THROUGHPUT.labels(model=model).observe(billed / duration if duration > 0 else 0)
-                                log.info("request_completed", extra={
-                                    "req_id": req_id,
-                                    "at_ms": _now_ms(),
-                                    "ollama_unattributed_ms": ollama_timings.get("unattributed_ms"),
-                                    "ollama_total_ms": ollama_timings.get("total_ms"),
-                                    "ollama_eval_ms": ollama_timings.get("eval_ms"),
-                                    "ollama_prompt_eval_ms": ollama_timings.get("prompt_eval_ms"),
-                                    "model": model, "stream": True,
-                                    "duration_s": round(e2e, 3),
-                                    "generation_s": round(duration, 3),
-                                    "tokens": billed,
-                                    # What the client actually received, which is a delta
-                                    # count and so not always the token count.
-                                    "tokens_sent": sent_tokens,
-                                    "tps": round(billed / duration if duration > 0 else 0, 1),
-                                })
-                                final = {
-                                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                                    "object": "chat.completion.chunk",
-                                    "model": model,
-                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                                }
-                                yield f"data: {json.dumps(final)}\n\n"
+                    if done:
+                        # generation time drives throughput; end-to-end drives latency
+                        duration = time.perf_counter() - gen_start
+                        e2e = time.perf_counter() - arrival
+                        # Attached only for the recording, never across a yield: see the note at the
+                        # top of this generator.
+                        with otel_trace.use_span(inf_span, end_on_exit=False):
+                            ollama_timings = _record_backend_timings(
+                                inf_span, meta.get("timings", {}))
+                            billed = _completion_tokens(meta, token_count)
+                            REQUEST_COUNT.labels(model=model, status="success", stream="true").inc()
+                            REQUEST_DURATION.labels(model=model, stream="true", status="success").observe(e2e)
+                            TOKENS_GENERATED.labels(model=model).inc(billed)
+                            THROUGHPUT.labels(model=model).observe(billed / duration if duration > 0 else 0)
+                            log.info("request_completed", extra={
+                                "req_id": req_id,
+                                "at_ms": _now_ms(),
+                                "ollama_unattributed_ms": ollama_timings.get("unattributed_ms"),
+                                "ollama_total_ms": ollama_timings.get("total_ms"),
+                                "ollama_eval_ms": ollama_timings.get("eval_ms"),
+                                "ollama_prompt_eval_ms": ollama_timings.get("prompt_eval_ms"),
+                                "model": model, "stream": True,
+                                "duration_s": round(e2e, 3),
+                                "generation_s": round(duration, 3),
+                                "tokens": billed,
+                                # What the client actually received, which is a delta
+                                # count and so not always the token count.
+                                "tokens_sent": sent_tokens,
+                                "tps": round(billed / duration if duration > 0 else 0, 1),
+                            })
+                        final = {
+                            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        }
+                        yield f"data: {json.dumps(final)}\n\n"
 
-                                # Separate usage chunk with empty choices, the shape the
-                                # OpenAI API uses for stream_options.include_usage. Chunk
-                                # counting is approximate; the backend's own count is not.
-                                usage = meta.get("usage", {})
-                                if usage and include_usage:
-                                    yield "data: " + json.dumps({
-                                        "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                                        "object": "chat.completion.chunk",
-                                        "model": model,
-                                        "choices": [],
-                                        "usage": usage,
-                                    }) + "\n\n"
-                                yield "data: [DONE]\n\n"
-                                outcome = "completed"
-                    except Exception as exc:
-                        # Past the first chunk the status is already sent, so a failure
-                        # can only be reported in-band. OpenAI's nested error shape: the
-                        # SDK reads .message off it and raises APIError.
-                        REQUEST_COUNT.labels(model=model, status="error", stream="true").inc()
-                        REQUEST_DURATION.labels(model=model, stream="true", status="error").observe(
-                            time.perf_counter() - arrival
-                        )
-                        log.error("request_failed", extra={"model": model, "error": str(exc)})
-                        inf_span.record_exception(exc)
-                        yield "data: " + json.dumps({
-                            "error": {
-                                "message": str(exc),
-                                "type": "upstream_error",
-                                "param": None,
-                                "code": None,
-                            }
-                        }) + "\n\n"
+                        # Separate usage chunk with empty choices, the shape the
+                        # OpenAI API uses for stream_options.include_usage. Chunk
+                        # counting is approximate; the backend's own count is not.
+                        usage = meta.get("usage", {})
+                        if usage and include_usage:
+                            yield "data: " + json.dumps({
+                                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+                                "object": "chat.completion.chunk",
+                                "model": model,
+                                "choices": [],
+                                "usage": usage,
+                            }) + "\n\n"
                         yield "data: [DONE]\n\n"
-                        outcome = "error"
+                        outcome = "completed"
+            except Exception as exc:
+                # Past the first chunk the status is already sent, so a failure
+                # can only be reported in-band. OpenAI's nested error shape: the
+                # SDK reads .message off it and raises APIError.
+                REQUEST_COUNT.labels(model=model, status="error", stream="true").inc()
+                REQUEST_DURATION.labels(model=model, stream="true", status="error").observe(
+                    time.perf_counter() - arrival
+                )
+                log.error("request_failed", extra={"model": model, "error": str(exc)})
+                inf_span.record_exception(exc)
+                yield "data: " + json.dumps({
+                    "error": {
+                        "message": str(exc),
+                        "type": "upstream_error",
+                        "param": None,
+                        "code": None,
+                    }
+                }) + "\n\n"
+                yield "data: [DONE]\n\n"
+                outcome = "error"
         finally:
             # One call, idempotent. The response's own teardown calls the same object,
             # so whichever of the three paths arrives first does the work: see
