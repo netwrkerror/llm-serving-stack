@@ -71,6 +71,30 @@ behind the collector and then closed **by** it.
 not change collection timing: retaining garbage changes how deallocations count against
 the gen-0 threshold. No evidence either way.
 
+### Which disconnect path this actually is
+
+Two independent signals, and they agree — but not in the way the version numbers alone
+would suggest.
+
+| signal | says |
+|--------|------|
+| uvicorn 0.32.0 | reports **`spec_version: "2.4"`** in both `h11_impl` and `httptools_impl` |
+| starlette 0.38.6 | **does not branch on it** — `spec_version` appears nowhere in the package |
+| the `DEBUG_SAVEALL` census | **158 `CancelledError` objects**, which is the task-group path's signature |
+
+At ASGI 2.4 and above there is no `listen_for_disconnect`: a disconnect arrives as an
+`OSError` from `send()` (uvicorn raises `ClientDisconnected(OSError)`), which unwinds by
+exception rather than by scope cancellation and would leave no `CancelledError` behind.
+The census is full of them, so the live path is the **task-group cancel**, below-2.4
+behaviour — because the installed Starlette ignores what uvicorn reports.
+
+So the n=59 validation ran against the real server and therefore covers the path that
+actually fires here. The agreement matters because it means **the risk is version
+coupling, not a mis-measurement**: upgrading Starlette to a release that honours
+`spec_version` 2.4 would silently move this stack onto the other path. Hence the pin in
+`gateway/requirements.txt`, and a unit test for the `OSError`-from-`send()` path even
+though nothing here exercises it today.
+
 ### The fix
 
 `ClosingStreamingResponse` closes `body_iterator` in a `finally`, under
@@ -110,22 +134,50 @@ rate of 5% or more. It does not rule out something rarer.
 
 ### Tokens generated after the client left
 
-Same measure as the 1596 wasted before — Ollama's own count minus what the client
-received, across the 59 genuine disconnect pairs:
+Both runs recomputed from the raw Ollama logs under **one counting rule**: Ollama's
+`eval_count` where llama.cpp printed a timing block, otherwise its context at release
+minus its prompt tokens. A cancelled task prints no timing block, so the fallback is the
+usual case and the source is recorded per pair.
 
-| | before (20 pairs) | after (59 pairs) |
+| | baseline, 20 pairs | validation, 59 pairs |
 |---|---|---|
-| total generated after close | **1596** | **655** |
-| **max per pair** | **~399** | **12** |
-| p50 per pair | 1 | 11 |
+| normal pairs: after-close **per pair, mean** | **11.6** | **11.1** |
+| normal pairs: p50 / max | 12 / 12 | 11 / 12 |
+| normal pairs: total | 186 | 655 |
+| late pairs: total | **1596** | **none** |
+| late pairs: max per pair | **399** | — |
+| whole arm total | 1782 | 655 |
 
-The max is the figure that moved: no pair can now run away to its full `max_tokens`.
+**The steady-state waste is unchanged, and that is the correct result.** ~11 tokens per
+pair before and after. It is the harness's own doing: A's client reads one chunk and then
+waits 60 ms so that B is certainly queued before the close, and Ollama generates through
+that settle at ~117 tok/s. The fix was never going to change that, and it did not.
 
-**Most of the 655 is the harness's own doing, not the gateway's.** A's client reads one
-chunk and then waits 60 ms before closing, so that B is certainly queued first. Ollama
-generates through that settle at ~117 tok/s, which is ~7 of the ~11 tokens per pair. The
-rest falls in the ~6 ms between the close and Ollama's cancel. So 655 is an upper bound
-on gateway-attributable waste, and the per-pair figure is set by the experiment's design.
+What the fix removed is the **late-pair** waste: the worst pair went from **399 tokens to
+12**, and the whole-arm total fell even though the arm is three times larger.
+
+**There is no 0.25-vs-11 discrepancy to explain; the 0.25 was an arithmetic error of
+mine.** An earlier draft said "4 wasted in the other 16 pairs", which implied ~0.25
+tokens per normal pair and made the 655 look like a regression. That figure was never
+computed — it was asserted. The baseline's 16 normal pairs wasted **186**, a mean of
+**11.62**, against the validation's **11.10**. The two agree, and the apparent gap
+existed only in the draft.
+
+What produced it: the 1596 and the 186 had been obtained by different methods, one from
+`eval_count` and one by eye, and nothing forced them onto the same rule.
+`benchmark/after_close.py` now applies one rule to any run directory and writes
+`after-close-by-pair.txt` beside the run, recording per pair the task id, tokens
+received, tokens generated, the difference, **and which source the count came from**. The
+two files behind this table are:
+
+- `run-queued-disconnect-20261122-202845/after-close-by-pair.txt`
+- `run-queued-disconnect-validate-20261122-215941/after-close-by-pair.txt`
+
+Source split: baseline 4 `eval_count` / 16 `ctx-prompt`, validation 1 / 58. The
+`eval_count` rows are precisely the pairs where Ollama ran to completion — a timing block
+means a normal finish — so in the baseline the four `eval_count` rows **are** the four
+late pairs, each at exactly 399 wasted. That is a cross-check rather than a coincidence:
+a pair that was never cancelled is a pair whose timings Ollama printed.
 
 ### Ordering, now resolved
 
