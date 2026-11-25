@@ -14,6 +14,212 @@ not measured is not listed here.
 
 ---
 
+## The disconnect fix, and what it is bounded to (2026-11-22)
+
+Stage 1b measured a disconnected request holding the gateway's only queue slot for
+101–155 seconds in 5 of 40 pairs. This is the cause, the fix, and the bound.
+
+### The cause, in three measured parts
+
+**1. Starlette never closes the body iterator.** Verified against the installed
+`starlette 0.38.6`: the string `aclose` appears **nowhere in the package**.
+`StreamingResponse.__call__` runs a task group where `listen_for_disconnect` returns on
+`http.disconnect` and cancels the group's scope, which cancels the task sitting in
+`async for chunk in self.body_iterator`. **A cancelled `async for` does not close its
+iterator.** So `event_stream` is left suspended and its `finally` — which releases the
+slot — is unreachable except by finalization.
+
+A nuance measured rather than assumed: cancelling a task group's *own* scope is absorbed
+by anyio, so `__call__` returns **normally** on a disconnect. That path is not itself
+inside a cancelled scope.
+
+**2. The generator is caught in a reference cycle, so finalization waits for the
+collector.** `gc.DEBUG_SAVEALL` found 4 `event_stream` generators in cycles; the direct
+holder of every one is `starlette.responses.StreamingResponse`. The cycle's type census
+is the mechanism: **1453 traceback, 1375 frame, 158 CancelledError** objects. The
+disconnect's `CancelledError` carries a traceback, the traceback holds frames, a frame
+holds the response, the response holds `body_iterator`. Refcount never reaches zero.
+
+The holder is **framework-created, not gateway-created**, so there was no gateway
+reference to remove.
+
+**3. The delay is the collector's schedule.** Forcing `gc.collect()` every second left
+the fault occurring at its usual rate but bounded it to **628, 637, 724 and 1110 ms** —
+one collection interval — against 101–155 s unforced.
+
+### Instrumentation shortens the delay, not the cycle
+
+| run | instrument | result |
+|-----|-----------|--------|
+| baseline + nodiag | none | **5 of 40 late** (101–155 s) |
+| gc-loop | `gc.collect()` every 1 s | **4 of 59 bounded** to ≤1.11 s |
+| saveall | `gc.DEBUG_SAVEALL` | **4 of 40 found in cycles**, all already closed |
+| diag + referrers | per-request registry | **0 of 60 late** |
+
+The last row is an observer effect, not a result: one-sided Fisher exact on 0/60 against
+5/40 gives **p = 0.0087**. The first version of the stuck-stream diagnostic allocated
+four objects per request, and allocation pressure is what drives CPython's generational
+collector. It suppressed the fault it was built to watch. Rebuilt to touch the request
+path zero times.
+
+CPython runs finalizers *before* `DEBUG_SAVEALL` retains an object — verified directly:
+a suspended generator in a cycle had its `finally` run during `gc.collect()` with the
+flag on. That is why all four caught generators show `ag_frame is None`: they were stuck
+behind the collector and then closed **by** it.
+
+**Unverified hypothesis** for why `DEBUG_SAVEALL` also showed 0 late pairs when it should
+not change collection timing: retaining garbage changes how deallocations count against
+the gen-0 threshold. No evidence either way.
+
+### Which disconnect path this actually is
+
+Two independent signals, and they agree — but not in the way the version numbers alone
+would suggest.
+
+| signal | says |
+|--------|------|
+| uvicorn 0.32.0 | reports **`spec_version: "2.4"`** in both `h11_impl` and `httptools_impl` |
+| starlette 0.38.6 | **does not branch on it** — `spec_version` appears nowhere in the package |
+| the `DEBUG_SAVEALL` census | **158 `CancelledError` objects**, which is the task-group path's signature |
+
+At ASGI 2.4 and above there is no `listen_for_disconnect`: a disconnect arrives as an
+`OSError` from `send()` (uvicorn raises `ClientDisconnected(OSError)`), which unwinds by
+exception rather than by scope cancellation and would leave no `CancelledError` behind.
+The census is full of them, so the live path is the **task-group cancel**, below-2.4
+behaviour — because the installed Starlette ignores what uvicorn reports.
+
+So the n=59 validation ran against the real server and therefore covers the path that
+actually fires here. The agreement matters because it means **the risk is version
+coupling, not a mis-measurement**: upgrading Starlette to a release that honours
+`spec_version` 2.4 would silently move this stack onto the other path. Hence the pin in
+`gateway/requirements.txt`, and a unit test for the `OSError`-from-`send()` path even
+though nothing here exercises it today.
+
+### The fix
+
+`ClosingStreamingResponse` closes `body_iterator` in a `finally`, under
+`anyio.CancelScope(shield=True)`. `_StreamCleanup` owns the generator, the spans and the
+slot, and runs **exactly once** whichever of the three paths reaches it first: the normal
+end of the stream, an in-band error, or the response being torn down.
+
+It also closes the pre-first-`__anext__` window previously recorded as untested in
+NOTES. Closing a generator that never started runs no `finally`, so the response falls
+back to calling the cleanup object directly.
+
+### Validation
+
+**Conditions**
+
+| | |
+|---|---|
+| Date | 2026-11-22, 21:59–22:04 MST |
+| Hardware | Apple M5 Pro (`Mac17,9`), arm64 |
+| Ollama | 0.32.5, `library=Metal` verified, `OLLAMA_NUM_PARALLEL:1` |
+| Gateway | compose, **1 queue slot** |
+| Load | 60 disconnect pairs + 20 control, A `max_tokens=400` closing after its first chunk |
+| Ollama log poll | **2 ms** (was 10 ms) |
+| Instruments | **none** — no gc loop, no stuck scanner, no `DEBUG_SAVEALL` |
+| Run dir | `benchmark/out/run-queued-disconnect-validate-20261122-215941/` |
+
+| | before | after |
+|---|--------|-------|
+| late pairs (slot held >10 s) | **5 / 40 = 12.5%** | **0 / 59** |
+| max slot held | **154,600 ms** | **63.6 ms** |
+| `finally` → B admitted | 2.35 ms p50 | 2.7 ms p50, max 4.3 ms |
+| `aclose()` duration | 0.002 ms p50 | 0.001 ms p50, max 0.362 ms |
+
+**Stated as a bound, not as "fixed".** Zero late pairs in 59 gives a one-sided 95% upper
+bound on the true rate of **4.95%**. `P(0 in 59 | 12.5%) = 3.8 × 10⁻⁴`. This rules out a
+rate of 5% or more. It does not rule out something rarer.
+
+### Tokens generated after the client left
+
+Both runs recomputed from the raw Ollama logs under **one counting rule**: Ollama's
+`eval_count` where llama.cpp printed a timing block, otherwise its context at release
+minus its prompt tokens. A cancelled task prints no timing block, so the fallback is the
+usual case and the source is recorded per pair.
+
+| | baseline, 20 pairs | validation, 59 pairs |
+|---|---|---|
+| normal pairs: after-close **per pair, mean** | **11.6** | **11.1** |
+| normal pairs: p50 / max | 12 / 12 | 11 / 12 |
+| normal pairs: total | 186 | 655 |
+| late pairs: total | **1596** | **none** |
+| late pairs: max per pair | **399** | — |
+| whole arm total | 1782 | 655 |
+
+**The steady-state waste is unchanged, and that is the correct result.** ~11 tokens per
+pair before and after. It is the harness's own doing: A's client reads one chunk and then
+waits 60 ms so that B is certainly queued before the close, and Ollama generates through
+that settle at ~117 tok/s. The fix was never going to change that, and it did not.
+
+What the fix removed is the **late-pair** waste: the worst pair went from **399 tokens to
+12**, and the whole-arm total fell even though the arm is three times larger.
+
+**There is no 0.25-vs-11 discrepancy to explain; the 0.25 was an arithmetic error of
+mine.** An earlier draft said "4 wasted in the other 16 pairs", which implied ~0.25
+tokens per normal pair and made the 655 look like a regression. That figure was never
+computed — it was asserted. The baseline's 16 normal pairs wasted **186**, a mean of
+**11.62**, against the validation's **11.10**. The two agree, and the apparent gap
+existed only in the draft.
+
+What produced it: the 1596 and the 186 had been obtained by different methods, one from
+`eval_count` and one by eye, and nothing forced them onto the same rule.
+`benchmark/after_close.py` now applies one rule to any run directory and writes
+`after-close-by-pair.txt` beside the run, recording per pair the task id, tokens
+received, tokens generated, the difference, **and which source the count came from**. The
+two files behind this table are:
+
+- `run-queued-disconnect-20261122-202845/after-close-by-pair.txt`
+- `run-queued-disconnect-validate-20261122-215941/after-close-by-pair.txt`
+
+Source split: baseline 4 `eval_count` / 16 `ctx-prompt`, validation 1 / 58. The
+`eval_count` rows are precisely the pairs where Ollama ran to completion — a timing block
+means a normal finish — so in the baseline the four `eval_count` rows **are** the four
+late pairs, each at exactly 399 wasted. That is a cross-check rather than a coincidence:
+a pair that was never cancelled is a pair whose timings Ollama printed.
+
+### Ordering, now resolved
+
+At a 2 ms poll the effect finally exceeds the instrument:
+
+| | |
+|---|---|
+| gap `B_admit − A_cancel` | p50 **−3.3 ms**, min −11.3, max +1.1 |
+| B admitted before Ollama's cancel | 53 of 59 |
+| gaps exceeding the ±1.646 ms clock uncertainty | 40 of 59 |
+
+The poll still biases the cancel stamp late by up to 2 ms, which flatters this direction,
+so the honest reading is **B is admitted roughly 1.3–3.3 ms before Ollama logs the
+cancel**. It costs B nothing: `ollama.unattributed_ms` is **1.4 ms p50 on the disconnect
+arm against 3.1 ms on control** — still lower, so the slot release is not handing B to a
+backend that is still busy.
+
+### A denominator correction, retroactive
+
+The `a_completed` exclusion — a pair where A's answer ends on its own before the client
+can cut it off — was applied back over every preserved run directory:
+
+- **Stage 1b pre-fix runs: 0 exclusions.** The 5/40 rate is unchanged. Applying this can
+  only ever raise a pre-fix rate, and here it raised nothing.
+- The two 60-pair runs each had **1**, so the gc test is **4 of 59** and the validation
+  **0 of 59**.
+- **Stage 1 was wrong, and inconsistent with its own table.** Its lead said "89 of 90"
+  while the table beneath it listed 110 requests. The preserved records hold **110 genuine
+  disconnects, 0 excluded, 109 cancelled promptly, 1 full-generation leak**. Corrected
+  throughout: the leak was **1 in 110**, not 1 in 90.
+
+### Not measured
+
+| | |
+|---|---|
+| Residual rate below 4.95% | untested — would need several hundred pairs |
+| The ASGI `spec_version` 2.4+ disconnect path (`ClientDisconnect` from `send()`) | untested at time of writing |
+| Why `DEBUG_SAVEALL` suppressed the fault | unverified hypothesis only |
+| The same experiment against a remote backend | **untested, Bedrock** |
+
+---
+
 ## Disconnect with a request queued behind it (2026-11-22)
 
 Stage 1 measured what a client disconnect does to the upstream. It did not measure what
@@ -66,7 +272,7 @@ run, and ran correctly — about 100 to 155 seconds late.
 received), against 4 wasted in the other 16 pairs combined.
 
 **This is the Stage 1 "cleanup is not guaranteed" case, reproduced at 4 in 20 rather than
-1 in 90**, and with a consequence Stage 1 could not see: the slot. Stage 1 ran at 4 slots
+1 in 110**, and with a consequence Stage 1 could not see: the slot. Stage 1 ran at 4 slots
 with nothing queued, so a late finalization cost only wasted tokens. At one slot with a
 request waiting, the same fault blocks the queue for two minutes.
 
@@ -672,7 +878,7 @@ The hypothesis under test was that when a streaming client hangs up, the gateway
 its semaphore slot but never closes the backend generator, so the httpx stream to Ollama
 stays open and **Ollama keeps generating**.
 
-**That is wrong in the common case.** In 89 of 90 measured disconnects Ollama cancelled
+**That is wrong in the common case.** In 109 of 110 measured disconnects Ollama cancelled
 the task 30–50 ms (median) after the client went away, wasting 1–3% of the tokens it had
 generated. The upstream was being closed all along — by async-generator finalization
 rather than by anything the gateway did deliberately.
@@ -728,7 +934,7 @@ In `run-disconnect-after-metal-20261115-172242/c4`, request 8 (Ollama task 1431)
 | client close → Ollama done | 2.738 s |
 
 This is precisely the behaviour the hypothesis predicted, and it happened *with* the fix
-in place. It is 1 occurrence in 90 disconnects: 0 of 50 in `before` at c=4, 1 of 40 in
+in place. It is 1 occurrence in 110 disconnects: 0 of 50 in `before` at c=4, 1 of 40 in
 `after`. With one event the arms cannot be separated, so **this is not attributable to
 the fix** — and it is not evidence the fix caused it. What it does show is that cleanup is
 not guaranteed in either arm.

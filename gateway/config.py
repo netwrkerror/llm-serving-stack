@@ -114,6 +114,29 @@ class Settings(BaseSettings):
     tracing_enabled: bool = False
     otlp_endpoint: str = "http://localhost:4317"
 
+    # Diagnostics for the late-finalization fault measured in Stage 1b, where a
+    # disconnected request's generator was not collected for 100+ seconds and held the
+    # gateway's queue slot. Both default off and exist to *prove a cause*, not to fix
+    # it: forcing collection on a timer would paper over the bug while paying for a
+    # full collection every interval.
+    #
+    # Seconds between forced gc.collect() calls. 0 disables.
+    gc_interval_seconds: float = 0.0
+    # Seconds after which a streaming request whose cleanup has not run is reported,
+    # with what still holds a reference to its generator. 0 disables.
+    #
+    # NOTE this one perturbs: see the measured observer effect in main.py.
+    diag_stuck_seconds: float = 0.0
+
+    # gc.DEBUG_SAVEALL: the collector puts what it finds into gc.garbage instead of
+    # freeing it. Adds nothing to the request path and does not change *when*
+    # collection happens, so the fault occurs at its natural rate — which the
+    # allocation-heavy diagnostic above does not manage. Every member of a cycle ends
+    # up in that list, so it answers "what holds the generator" directly.
+    #
+    # Memory grows for as long as it is on. Diagnostic runs only.
+    gc_saveall: bool = False
+
     # model_fast/_balanced/_powerful collide with pydantic's reserved "model_" prefix;
     # these are model names, not pydantic internals.
     model_config = {"env_prefix": "GATEWAY_", "protected_namespaces": ()}

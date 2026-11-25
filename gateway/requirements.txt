@@ -1,5 +1,21 @@
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
+# Pinned because the gateway depends on a behaviour of this exact version, not just an
+# API. starlette's StreamingResponse never closes body_iterator (no `aclose` anywhere in
+# 0.38.6, and still none in 1.10.0), which is why gateway/main.py has
+# ClosingStreamingResponse -- see "The disconnect fix" in benchmark/RESULTS.md.
+#
+# 0.38.6 also ignores the ASGI spec_version. uvicorn 0.32 reports "2.4", and starlette
+# versions that READ spec_version (1.10.0 does) take a different disconnect path at
+# 2.4+: no listen_for_disconnect, and the disconnect instead arrives as an OSError from
+# send(), re-raised as ClientDisconnect. So upgrading starlette switches our LIVE
+# disconnect path, without any change here.
+#
+# tests/test_cancel.py covers both paths, but the tests are not the evidence that
+# matters: the 0/59-late result comes from a real server under load. **Upgrading
+# starlette or uvicorn means re-running benchmark/run_queued_disconnect.sh on the new
+# path, not just the test suite.**
+starlette==0.38.6
 httpx>=0.27.0
 prometheus-client==0.21.0
 pydantic==2.9.2

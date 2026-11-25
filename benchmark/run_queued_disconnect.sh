@@ -23,7 +23,7 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 STACK_DIR="$PWD"
-RUN_ID="run-queued-disconnect-$(date +%Y%m%d-%H%M%S)"
+RUN_ID="run-queued-disconnect${LABEL:+-$LABEL}-$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="$STACK_DIR/benchmark/out/$RUN_ID"
 mkdir -p "$RUN_DIR"
 OUT="$RUN_DIR/transcript.txt"
@@ -34,7 +34,15 @@ SLOTS=1                    # and one gateway slot
 GATEWAY="http://localhost:8000"
 PROM="http://localhost:9090"
 OLLAMA_LOG="/tmp/ollama_p${PARALLEL}.log"
-if [[ -n "${QUICK:-}" ]]; then PAIRS=3; else PAIRS=20; fi
+if [[ -n "${QUICK:-}" ]]; then PAIRS=3; else PAIRS="${PAIRS:-20}"; fi
+CONTROL_PAIRS="${CONTROL_PAIRS:-$PAIRS}"
+ARMS="${ARMS:-disconnect,control}"
+LOG_POLL_MS="${LOG_POLL_MS:-10}"
+# Diagnostics for the Stage 1b late-finalization fault. Both off unless asked for.
+GC_INTERVAL="${GC_INTERVAL:-0}"
+GC_SAVEALL="${GC_SAVEALL:-false}"
+DIAG_STUCK="${DIAG_STUCK:-0}"
+LABEL="${LABEL:-}"
 
 die() { echo "ABORT: $*" >&2; exit 1; }
 step() { echo; echo "=== $* ==="; }
@@ -51,7 +59,8 @@ done
 
 exec > >(tee "$OUT") 2>&1
 
-echo "queued disconnect | pairs=$PAIRS per arm | OLLAMA_NUM_PARALLEL=$PARALLEL slots=$SLOTS"
+echo "queued disconnect | arms=$ARMS pairs=$PAIRS control=$CONTROL_PAIRS | OLLAMA_NUM_PARALLEL=$PARALLEL slots=$SLOTS"
+echo "log poll=${LOG_POLL_MS}ms | gc_interval=${GC_INTERVAL}s | diag_stuck=${DIAG_STUCK}s | gc_saveall=${GC_SAVEALL}"
 echo "host: $(uname -m) | $(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
 echo "ollama: $(ollama --version 2>&1 | tr -d '\n') | python: $($PY -V 2>&1)"
 echo "run id: $RUN_ID"
@@ -109,6 +118,9 @@ services:
   gateway:
     environment:
       GATEWAY_MAX_CONCURRENT_REQUESTS: "$SLOTS"
+      GATEWAY_GC_INTERVAL_SECONDS: "$GC_INTERVAL"
+      GATEWAY_GC_SAVEALL: "$GC_SAVEALL"
+      GATEWAY_DIAG_STUCK_SECONDS: "$DIAG_STUCK"
 YML
 COMPOSE=(docker compose -f docker-compose.yml -f "$RUN_DIR/compose-override.yml")
 "${COMPOSE[@]}" up -d --build 2>&1 | tail -2
@@ -134,7 +146,9 @@ RUN_START="$(date -u +%Y-%m-%dT%H:%M:%S)"
 
 step "9. Run $PAIRS pairs per arm"
 "$PY" benchmark/queued_disconnect.py \
-    --pairs "$PAIRS" --model "$MODEL" --gateway "$GATEWAY" \
+    --pairs "$PAIRS" --control-pairs "$CONTROL_PAIRS" --arms "$ARMS" \
+    --log-poll-ms "$LOG_POLL_MS" \
+    --model "$MODEL" --gateway "$GATEWAY" \
     --ollama-log "$OLLAMA_LOG" \
     --gateway-log "$RUN_DIR/gateway-live.log" \
     --out "$RUN_DIR" &
@@ -153,6 +167,22 @@ echo "  gateway.log  $(wc -l < "$RUN_DIR/gateway.log") lines"
 echo "  ollama.log   $(wc -l < "$RUN_DIR/ollama.log") lines"
 echo "  cancel lines: $(grep -c 'cancel task' "$RUN_DIR/ollama.log" || true)"
 echo "  slot_acquired lines: $(grep -c slot_acquired "$RUN_DIR/gateway.log" || true)"
+echo "  stuck_stream lines:  $(grep -c stuck_stream "$RUN_DIR/gateway.log" || true)"
+echo "  gc_collected lines:  $(grep -c gc_collected "$RUN_DIR/gateway.log" || true)"
+if grep -q stuck_stream "$RUN_DIR/gateway.log"; then
+    echo
+    echo "  --- what held the suspended generator ---"
+    grep stuck_stream "$RUN_DIR/gateway.log" | head -4
+fi
+
+if [[ "$GC_SAVEALL" == "true" ]]; then
+    step "10b. What the collector found in cycles (GATEWAY_GC_SAVEALL)"
+    if curl -fsS --max-time 30 "$GATEWAY/debug/gc-garbage" > "$RUN_DIR/gc-garbage.json" 2>/dev/null; then
+        "$PY" benchmark/show_gc_garbage.py "$RUN_DIR/gc-garbage.json"
+    else
+        echo "  (could not read /debug/gc-garbage)"
+    fi
+fi
 
 step "11. Export this run's Prometheus data"
 if SNAP=$(curl -fsS --max-time 60 -XPOST "$PROM/api/v1/admin/tsdb/snapshot" \

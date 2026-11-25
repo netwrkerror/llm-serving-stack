@@ -119,7 +119,7 @@ this repo should go through a real server, not `TestClient`.
 ## Stage 1 — client disconnect (2026-11-15)
 
 **The hypothesis was wrong, and that is the interesting part.** Ollama does not keep
-generating after a streaming client leaves: 89 of 90 measured disconnects were cancelled
+generating after a streaming client leaves: 109 of 110 measured disconnects were cancelled
 within 30–50 ms, wasting 1–3% of tokens. The upstream connection was already being closed
 — by CPython dropping the last reference to the suspended async generator and asyncio's
 finalizer hook scheduling `aclose()`. Nothing in the gateway was doing it on purpose,
@@ -680,8 +680,8 @@ says "wrong in four places, in both directions" instead.
 
 ## Stage 1b — disconnect with a request queued behind it (2026-11-22)
 
-**Stage 1's "1 in 90" turned into 4 in 20, and the consequence got much worse.** Stage 1
-saw one request out of ~90 run to full `max_tokens` after its client left, and recorded
+**Stage 1's "1 in 110" turned into 4 in 20, and the consequence got much worse.** Stage 1
+saw one request out of 110 run to full `max_tokens` after its client left, and recorded
 it as evidence that cleanup is not guaranteed. At one gateway slot with a request queued
 behind, the same fault showed up in 4 of 20 pairs — and this time it did not just waste
 tokens, it **held the gateway's only slot for 101 to 155 seconds**. B sat on the
@@ -736,3 +736,94 @@ rather than assume it.
 Whether the late-finalization rate moves with slot count, model size or token budget is
 untested, and 4 of 20 is a wide confidence interval on a rate. `aclose()` itself costs
 0.002 ms p50, so nothing here argues against calling it; the cost is in *reaching* it.
+
+## The disconnect fix — follow-ups (2026-11-23)
+
+**Which disconnect path is live, and why the version numbers alone mislead.** uvicorn
+0.32.0 reports ASGI `spec_version: "2.4"` in both `h11_impl` and `httptools_impl`. At
+2.4+ there is no `listen_for_disconnect`: a disconnect arrives as an `OSError` from
+`send()` (uvicorn raises `ClientDisconnected(OSError)`) and unwinds by exception rather
+than by scope cancellation. So on the version numbers, our live path should be that one.
+It is not: `spec_version` appears **nowhere** in starlette 0.38.6, which always uses the
+task-group cancel. The `DEBUG_SAVEALL` census settles it independently — **158
+`CancelledError` objects**, which the exception path would not leave behind. Two signals
+agreeing is what makes the n=59 validation relevant: it ran on the path that actually
+fires.
+
+**The upgrade is the risk, not the current code.** A starlette release that reads
+`spec_version` moves this stack onto the untested path with no change on our side. Hence
+the pin, and the pin's comment says to re-run `run_queued_disconnect.sh`, not just the
+test suite — the 0/59 result is a real-server measurement and a green suite does not
+substitute for it.
+
+**The `OSError`-from-`send()` tests failed first, and the fix was innocent.** The
+exception comes back **wrapped in an `ExceptionGroup`**, because `stream_response` runs
+in starlette's anyio task group. My first version caught bare `OSError`, so the test
+errored while `backend_stream_closed` was plainly in the log. A negative control settles
+that the tests are not vacuous: with plain `StreamingResponse` the same scenario leaves
+`backend_closed=False, slot_returned=False`.
+
+**Someone has already reported this upstream.** [Kludex/starlette PR #3685, "Close
+`StreamingResponse` iterator on disconnect"](https://github.com/Kludex/starlette/pull/3685)
+— **open, not merged** at the time of writing. It closes the body iterator around both
+HTTP paths before the background task runs, and covers the same three cases we do:
+spec_version 2.0 disconnect, spec_version 2.4 send error, and outer cancellation. So this
+is a known framework gap rather than something peculiar to this gateway, and
+`ClosingStreamingResponse` is the local version of a fix that may eventually land
+upstream. Nothing filed from here.
+
+**Their shielding is better than mine, and it is a real cost difference.** They shield
+the close *only* when an exception is propagating, and close unshielded on normal exit,
+explicitly "to avoid creating a `CancelScope` on every response". I shield
+unconditionally, so every streaming response pays for a `CancelScope` it will never use.
+Measured earlier: the cleanup path has no cancellation checkpoints in the normal case, so
+the shield is doing nothing there. Worth adopting; not done, because it is a
+micro-optimisation on a path that has just been stabilised and I would rather change one
+thing at a time. **Untested either way** — no measurement of what a `CancelScope` per
+response costs.
+
+**OTel's `Failed to detach context` is fixed rather than carried.** It was two ERROR
+lines per cancelled request, pre-existing (8 in the Stage 1b run, 8 in the gc test) but
+about to become routine once external closing was the normal path. Cause: `use_span`
+held across the `yield`s in `event_stream`. Its exit resets a contextvar token, and a
+generator closed from another task resets it in a different Context, which raises.
+
+The fix cost exactly what I guessed it might, so it is worth recording that the first
+version was wrong: removing the managers took the errors to zero **and dropped
+`trace_id` from `request_completed`**, because the log filter reads
+`get_current_span()`. Spans are now attached only around non-yielding sections — the
+first-token event, the completion recording, the in-band error, and the cleanup's own two
+log lines. All four lines carry `trace_id` again, with zero detach errors.
+
+Parentage was never at risk: a span's parent is fixed when it is created, and both spans
+are created in `_stream_response` where the request span is still attached. Rather than
+check Jaeger by eye, `test_inference_span_is_still_a_child_of_the_request_span` asserts
+it. That test needed a real SDK `TracerProvider` — with tracing off, the shipped default,
+every span is a `NonRecordingSpan` with no parentage, and the first version of the test
+failed on `AttributeError` instead of passing vacuously.
+
+**The per-pair waste figure, reconciled — the discrepancy was mine.** An earlier draft
+said the baseline wasted "4 tokens across the other 16 pairs", implying ~0.25 per pair
+against the validation's ~11, which looked like the fix had made steady-state waste 40×
+worse. That 4 was never computed; it was asserted. Recomputed from raw logs under one
+rule, the baseline's 16 normal pairs wasted **186, a mean of 11.62**, against the
+validation's **11.10**. They agree. Steady-state waste is unchanged, which is the correct
+result — it is the harness's own 60 ms settle, and no code change was going to move it.
+What the fix removed is the late pairs' **1596**, and the worst pair went from **399
+tokens to 12**.
+
+The real lesson is the one about method, not arithmetic: the 1596 and the 4 had been
+produced by different procedures, and nothing forced them onto the same rule.
+`benchmark/after_close.py` now applies one rule to any run directory and writes
+`after-close-by-pair.txt` beside the run, recording **per pair** which source each count
+came from. Two runs cannot silently diverge again.
+
+**The shield stays unconditional, deliberately differing from upstream.** Kludex/starlette
+PR #3685 shields the close only while an exception is propagating and closes unshielded
+on normal exit, to avoid building a `CancelScope` on every response. This gateway shields
+every time, for two reasons. The cost is microseconds of scope setup against a request
+measured in hundreds of milliseconds, so it is not a trade worth making. And the
+unconditional version covers a case the conditional one does not: a shutdown cancellation
+arriving in the middle of an ordinary close still lets that close finish, rather than
+being cut off because no exception happened to be in flight when it started. Recorded as
+a divergence rather than an oversight; nothing queued to change it.
