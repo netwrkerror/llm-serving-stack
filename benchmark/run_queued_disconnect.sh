@@ -28,6 +28,7 @@ RUN_DIR="$STACK_DIR/benchmark/out/$RUN_ID"
 mkdir -p "$RUN_DIR"
 OUT="$RUN_DIR/transcript.txt"
 
+
 MODEL="${MODEL:-llama3.2:1b}"
 PARALLEL=1                 # the whole point: one Ollama slot
 SLOTS=1                    # and one gateway slot
@@ -43,6 +44,17 @@ GC_INTERVAL="${GC_INTERVAL:-0}"
 GC_SAVEALL="${GC_SAVEALL:-false}"
 DIAG_STUCK="${DIAG_STUCK:-0}"
 LABEL="${LABEL:-}"
+
+# shellcheck source=benchmark/lib/validity.sh
+source "$STACK_DIR/benchmark/lib/validity.sh"
+validity_init "$RUN_DIR"
+expect "Ollama on Metal, not a CPU fallback"      "$OLLAMA_LOG"            "library=Metal" 1
+expect_absent "Ollama NOT on a CPU-only build"    "$OLLAMA_LOG"            "library=cpu"
+expect "OLLAMA_NUM_PARALLEL reached the server"   "$OLLAMA_LOG"            "OLLAMA_NUM_PARALLEL:$PARALLEL"
+expect "gateway came up with one queue slot"      "$RUN_DIR/transcript.txt" '"queue_slots":1'
+expect "the clock offset was measurable"          "$RUN_DIR/report.txt"     "offset_ms_best"
+expect "every disconnect pair ran"                "$RUN_DIR/report.txt"     "disconnect pairs usable        $PAIRS/$PAIRS"
+expect "the gateway log carries req_ids"          "$RUN_DIR/gateway.log"    "req_id" 10
 
 die() { echo "ABORT: $*" >&2; exit 1; }
 step() { echo; echo "=== $* ==="; }
@@ -206,3 +218,5 @@ echo "  gateway back to shipped config, Ollama back to NUM_PARALLEL=4"
 echo
 echo "=== done ==="
 echo "run dir: $RUN_DIR"
+
+validate_run || echo "  (numbers do not count)"

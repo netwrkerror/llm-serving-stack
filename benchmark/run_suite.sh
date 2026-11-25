@@ -38,6 +38,14 @@ RUN_ID="run-${PARALLEL}-$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="$STACK_DIR/benchmark/out/$RUN_ID"
 mkdir -p "$RUN_DIR"
 OUT="$RUN_DIR/transcript.txt"
+# shellcheck source=benchmark/lib/validity.sh
+source "$STACK_DIR/benchmark/lib/validity.sh"
+validity_init "$RUN_DIR"
+expect "OLLAMA_NUM_PARALLEL reached the server"  "$OLLAMA_LOG" "OLLAMA_NUM_PARALLEL:$PARALLEL"
+expect_absent "Ollama NOT on a CPU-only build"   "$OLLAMA_LOG" "library=cpu"
+expect "the gateway reported a healthy backend"  "$RUN_DIR/transcript.txt" '"status":"ok"'
+expect "every scenario ran"                      "$RUN_DIR/transcript.txt" "requests \| stream" 3
+
 
 MODEL="${MODEL:-llama3.2:1b}"
 GATEWAY="http://localhost:8000"
@@ -245,6 +253,8 @@ print("\n".join(lines[:7]))
 if len(rows) > 5:
     print(f"  ... {len(rows)-5} more in the file")
 PYEOF
+
+validate_run || echo "  (continuing so the run is preserved; the numbers do not count)"
 
 step "12. Export this run's Prometheus data"
 if SNAP=$(curl -fsS --max-time 60 -XPOST "$PROM/api/v1/admin/tsdb/snapshot" \

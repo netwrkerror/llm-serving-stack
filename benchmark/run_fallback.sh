@@ -34,6 +34,7 @@ RUN_DIR="$STACK_DIR/benchmark/out/$RUN_ID"
 mkdir -p "$RUN_DIR"
 OUT="$RUN_DIR/transcript.txt"
 
+
 MODEL="${MODEL:-llama3.2:1b}"
 PARALLEL="${PARALLEL:-4}"
 GATEWAY="http://localhost:8000"
@@ -43,6 +44,17 @@ SECONDARY_LOG="$RUN_DIR/ollama-secondary.log"
 KILL_AFTER="${KILL_AFTER:-10}"
 
 if [[ -n "${QUICK:-}" ]]; then N=8; REPS=1; else N=24; REPS=2; fi
+
+# shellcheck source=benchmark/lib/validity.sh
+source "$STACK_DIR/benchmark/lib/validity.sh"
+validity_init "$RUN_DIR"
+expect "primary Ollama on Metal"                  "$PRIMARY_LOG"   "library=Metal" 1
+expect "secondary Ollama on Metal"                "$SECONDARY_LOG" "library=Metal" 1
+expect_absent "neither server on a CPU build"     "$PRIMARY_LOG"   "library=cpu"
+expect "setting reached the primary"              "$PRIMARY_LOG"   "OLLAMA_NUM_PARALLEL:$PARALLEL"
+expect "setting reached the secondary"            "$SECONDARY_LOG" "OLLAMA_NUM_PARALLEL:$PARALLEL"
+expect "the kill landed mid-run, not after it"    "$RUN_DIR/transcript.txt" "kill landed mid-run: yes" "$REPS"
+expect "fallback actually fired"                  "$RUN_DIR/transcript.txt" "fell back  *[1-9]" "$REPS"
 C=4
 # 400 rather than the suite's 120 so the run lasts comfortably longer than KILL_AFTER.
 # At 120 tokens the n=24 c=4 scenario finishes in ~8s on this machine, i.e. before the
@@ -242,3 +254,5 @@ echo "  single Ollama back on 11434, gateway back to shipped config"
 echo
 echo "=== done ==="
 echo "run dir: $RUN_DIR"
+
+validate_run || echo "  (numbers do not count)"

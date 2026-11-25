@@ -43,6 +43,15 @@ RUN_ID="run-disconnect-${LABEL}-$(date +%Y%m%d-%H%M%S)"
 RUN_DIR="$STACK_DIR/benchmark/out/$RUN_ID"
 mkdir -p "$RUN_DIR"
 OUT="$RUN_DIR/transcript.txt"
+# shellcheck source=benchmark/lib/validity.sh
+source "$STACK_DIR/benchmark/lib/validity.sh"
+validity_init "$RUN_DIR"
+expect "Ollama on Metal, not a CPU fallback"      "$OLLAMA_LOG" "library=Metal" 1
+expect_absent "Ollama NOT on a CPU-only build"    "$OLLAMA_LOG" "library=cpu"
+expect "OLLAMA_NUM_PARALLEL reached the server"   "$OLLAMA_LOG" "OLLAMA_NUM_PARALLEL:$PARALLEL"
+expect "the shell was not running translated"     "$RUN_DIR/transcript.txt" "shell arch: arm64"
+expect "both cells produced a report"             "$RUN_DIR/c1/report.txt" "requests disconnected"
+
 
 MODEL="${MODEL:-llama3.2:1b}"
 GATEWAY="http://localhost:8000"
@@ -236,6 +245,8 @@ step "12. Save the slice of Ollama's log this run produced"
 tail -c "+$((LOG_OFFSET + 1))" "$OLLAMA_LOG" > "$RUN_DIR/ollama-log-slice.txt"
 echo "  $(wc -l < "$RUN_DIR/ollama-log-slice.txt") lines -> $RUN_DIR/ollama-log-slice.txt"
 echo "  cancel lines: $(grep -c "cancel task" "$RUN_DIR/ollama-log-slice.txt" || true)"
+
+validate_run || echo "  (continuing so the run is preserved; the numbers do not count)"
 
 step "13. Export this run's Prometheus data"
 if SNAP=$(curl -fsS --max-time 60 -XPOST "$PROM/api/v1/admin/tsdb/snapshot" \
